@@ -6,6 +6,7 @@ import traceback
 import json
 import shutil
 import asyncio
+import copy
 from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
@@ -25,9 +26,10 @@ except ImportError:
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 class _ComfyImageMarker:
     """多图模式的图片占位标记，存储 prompt 信息，在 chain 中占位"""
-    def __init__(self, prompt: str, index: int):
+    def __init__(self, prompt: str, index: int, lora_selections=None):
         self.prompt = prompt
         self.index = index
+        self.lora_selections = lora_selections or []
 
 @register(
     "astrbot_plugin_comfyui_pro",  
@@ -37,6 +39,19 @@ class _ComfyImageMarker:
     "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
 )
 class ComfyUIPlugin(Star):
+    _FORCE_DRAW_CONTEXT_LIMIT = 12
+    _FORCE_DRAW_MIN_REPLY_LENGTH = 100
+    _DRAW_FAILURE_CONTEXT_TTL_SECONDS = 600
+    _DRAW_FAILURE_CONTEXT_LIMIT = 5
+    _PIC_PROMPT_TAG_PATTERN = re.compile(
+        r'<pic\b[^>]*\bprompt=(?P<quote>["\'])(?P<prompt>.*?)(?P=quote)[^>]*?/?>\s*(?:</pic>)?',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    _PIC_PROMPT_UNCLOSED_PATTERN = re.compile(
+        r'<pic\b(?P<prefix>[^>]*\bprompt=)(?P<quote>["\'])(?P<prompt>.*?)</pic>',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
@@ -60,6 +75,7 @@ class ComfyUIPlugin(Star):
         control_conf = config.get("control", {})
         self.cooldown_seconds = control_conf.get("cooldown_seconds", 60)
         self.user_cooldowns = {}
+        self._recent_draw_failures = {}
         self.admin_user_ids = set(map(str, control_conf.get("admin_ids", [])))
         self.lockdown = bool(control_conf.get("lockdown", False))
         self.lockdown_command_enabled = bool(control_conf.get("lockdown_command_enabled", True))
@@ -70,8 +86,20 @@ class ComfyUIPlugin(Star):
         logger.info(f"[ComfyUI] 🖼️ 多图模式: {'开启' if self.multi_image_mode else '关闭'}")
         
         self.discard_prompt_from_history = llm_settings.get("discard_prompt_from_history", False)
+        self.force_draw_when_no_prompt = bool(llm_settings.get("force_draw_when_no_prompt", False))
+        self.target_image_count = self._coerce_target_image_count(
+            llm_settings.get("target_image_count", 1),
+        )
+        self.lora_control_conf = llm_settings.get("lora_control", {}) or {}
+        self.lora_control_enabled = bool(self.lora_control_conf.get("enabled", False))
         if self.discard_prompt_from_history:
-            logger.info("[ComfyUI] 🗑️ 绘图提示词历史丢弃: 开启")       
+            logger.info("[ComfyUI] 🗑️ 绘图提示词历史丢弃: 开启")
+        if self.force_draw_when_no_prompt:
+            logger.info(
+                f"[ComfyUI] 🎯 强制画图兜底: 开启（回复正文不少于 {self._FORCE_DRAW_MIN_REPLY_LENGTH} 字时生效）",
+            )
+        if self.target_image_count > 1:
+            logger.info(f"[ComfyUI] 🖼️ 目标出图数量: {self.target_image_count}")
         # 策略配置
         self.default_group_policy = str(control_conf.get("default_group_policy", "none")).lower()
         self.default_private_policy = str(control_conf.get("default_private_policy", "none")).lower()
@@ -201,7 +229,7 @@ class ComfyUIPlugin(Star):
             # 排除 .steps.json 文件
             files = sorted([
                 f.name for f in workflow_dir.glob("*.json")
-                if not f.name.endswith(".steps.json")
+                if not self._is_workflow_aux_file(f.name)
             ])
         
             if not files:
@@ -291,12 +319,126 @@ class ComfyUIPlugin(Star):
         
         return False, sensitive
 
+    def _compact_draw_prompt(self, prompt, limit: int = 240) -> str:
+        if prompt is None:
+            return ""
+        if isinstance(prompt, (list, tuple)):
+            prompt = " | ".join(str(item) for item in prompt if item is not None)
+        text = re.sub(r"\s+", " ", str(prompt)).strip()
+        if not text:
+            return ""
+        return text[:limit] + ("..." if len(text) > limit else "")
+
+    def _extract_command_prompt(self, event: AstrMessageEvent) -> str:
+        full_message = (getattr(event, "message_str", "") or "").strip()
+        parts = full_message.split(None, 1)
+        return parts[1].strip() if len(parts) > 1 else ""
+
+    def _remember_draw_failure(
+        self,
+        event: AstrMessageEvent,
+        reason: str,
+        *,
+        prompt: str = "",
+        source: str = "绘图",
+        append: bool = False,
+    ) -> None:
+        origin = getattr(event, "unified_msg_origin", None)
+        if not origin:
+            return
+
+        reason_text = re.sub(r"\s+", " ", str(reason or "")).strip()
+        if not reason_text:
+            return
+
+        now = time.time()
+        record = {
+            "ts": now,
+            "reason": reason_text,
+            "prompt": self._compact_draw_prompt(prompt),
+            "source": str(source or "绘图"),
+            "user_id": str(event.get_sender_id()),
+        }
+
+        records = self._recent_draw_failures.get(origin, []) if append else []
+        records = [
+            item
+            for item in records
+            if now - float(item.get("ts", 0)) <= self._DRAW_FAILURE_CONTEXT_TTL_SECONDS
+        ]
+        records.append(record)
+        self._recent_draw_failures[origin] = records[-self._DRAW_FAILURE_CONTEXT_LIMIT :]
+
+        try:
+            event.set_extra("comfy_last_draw_failure", record)
+        except Exception:
+            pass
+
+    def _clear_draw_failures(self, event: AstrMessageEvent) -> None:
+        origin = getattr(event, "unified_msg_origin", None)
+        if origin:
+            self._recent_draw_failures.pop(origin, None)
+
+    def _build_draw_failure_context(self, event: AstrMessageEvent) -> str:
+        origin = getattr(event, "unified_msg_origin", None)
+        if not origin:
+            return ""
+
+        now = time.time()
+        records = [
+            item
+            for item in self._recent_draw_failures.get(origin, [])
+            if now - float(item.get("ts", 0)) <= self._DRAW_FAILURE_CONTEXT_TTL_SECONDS
+        ]
+        if not records:
+            self._recent_draw_failures.pop(origin, None)
+            return ""
+
+        self._recent_draw_failures[origin] = records[-self._DRAW_FAILURE_CONTEXT_LIMIT :]
+        lines = [
+            "<comfyui_draw_status>",
+            "这是 ComfyUI 插件注入的内部状态，不是用户发言。",
+            "最近一次或几次绘图没有生成图片；如果用户追问刚才的画图结果，请明确说明失败，并引用下面的原因。",
+        ]
+
+        for idx, item in enumerate(records[-self._DRAW_FAILURE_CONTEXT_LIMIT :], 1):
+            ts = time.strftime("%H:%M:%S", time.localtime(float(item.get("ts", now))))
+            line = (
+                f"{idx}. 时间: {ts}; 来源: {item.get('source', '绘图')}; "
+                f"用户ID: {item.get('user_id', '')}; 失败原因: {item.get('reason', '')}"
+            )
+            if item.get("prompt"):
+                line += f"; 提示词: {item.get('prompt')}"
+            lines.append(line)
+
+        lines.append("</comfyui_draw_status>")
+        return "<!--EPHEMERAL-->\n" + "\n".join(lines) + "\n<!--/EPHEMERAL-->"
+
+    def _inject_draw_failure_context(self, event: AstrMessageEvent, req) -> None:
+        status_text = self._build_draw_failure_context(event)
+        if not status_text:
+            return
+
+        if hasattr(req, "add_user_text"):
+            try:
+                req.add_user_text(
+                    status_text,
+                    slot="comfyui_draw_status",
+                    after="system_reminder",
+                )
+            except Exception:
+                req.add_user_text(status_text, slot="comfyui_draw_status")
+        else:
+            current_prompt = getattr(req, "system_prompt", "") or ""
+            req.system_prompt = f"{current_prompt}\n\n{status_text}".strip()
+
+        logger.info("[ComfyUI] 已向本轮 LLM 请求注入最近绘图失败状态")
+
     @filter.on_llm_request(priority=100)
     async def inject_system_prompt(self, event: AstrMessageEvent, req):
         """注入系统提示词 + 清理历史中的绘图提示词"""
         try:
-            llm_settings = self.config.get("llm_settings", {}) 
-            my_prompt = llm_settings.get("system_prompt", "")
+            my_prompt = self._get_comfy_system_prompt()
 
             if my_prompt:
                 current_prompt = getattr(req, "system_prompt", "") or ""
@@ -304,10 +446,15 @@ class ComfyUIPlugin(Star):
                     if current_prompt:
                         req.system_prompt = f"{current_prompt}\n\n{my_prompt}".strip()
                     else:
-                        req.system_prompt = my_prompt.strip()
+                        req.system_prompt = my_prompt
 
         except Exception as e:
             logger.error(f"[ComfyUI] 注入提示词异常: {e}")
+
+        try:
+            self._inject_draw_failure_context(event, req)
+        except Exception as e:
+            logger.error(f"[ComfyUI] 注入绘图失败状态异常: {e}")
 
         # 清理历史中的绘图提示词
         if self.discard_prompt_from_history:
@@ -318,8 +465,6 @@ class ComfyUIPlugin(Star):
 
     def _clean_pic_tags_from_req(self, req):
         """从请求的 conversation.history 中清理 <pic> 标签"""
-        pic_pattern = re.compile(r'<pic\s+prompt=".*?">', re.DOTALL)
-
         conversation = getattr(req, "conversation", None)
         if conversation is None:
             logger.warning("[ComfyUI] 🗑️ req.conversation 不存在，跳过清理")
@@ -344,14 +489,606 @@ class ComfyUIPlugin(Star):
             if entry.get("role") != "assistant":
                 continue
             content = entry.get("content", "")
-            if isinstance(content, str) and pic_pattern.search(content):
-                entry["content"] = pic_pattern.sub("", content).strip()
-                cleaned += 1
+            if isinstance(content, str):
+                stripped = self._strip_comfy_control_tags(content, remove_think=True)
+                if self._find_pic_prompt_matches(content) or "<lora " in content.lower():
+                    entry["content"] = stripped
+                    cleaned += 1
 
         if cleaned:
             # 写回 conversation.history
             conversation.history = json.dumps(history, ensure_ascii=False)
             logger.info(f"[ComfyUI] 🗑️ 已从 conversation.history 中清理 {cleaned} 条消息的绘图提示词")
+
+    @staticmethod
+    def _is_workflow_aux_file(filename: str) -> bool:
+        return filename.endswith(".steps.json") or filename.endswith(".lora.json")
+
+    @staticmethod
+    def _strip_comfy_control_tags(text: str, remove_think: bool = False) -> str:
+        if not isinstance(text, str):
+            return text
+
+        cleaned = re.sub(r'<lora\s+picks=".*?"\s*/?>', "", text, flags=re.DOTALL | re.IGNORECASE)
+        pic_matches = ComfyUIPlugin._find_pic_prompt_matches(cleaned)
+        cleaned = ComfyUIPlugin._remove_text_spans(
+            cleaned,
+            [(item["start"], item["end"]) for item in pic_matches],
+        )
+        cleaned = re.sub(r"</pic>", "", cleaned, flags=re.IGNORECASE)
+        if remove_think:
+            cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"</?ctx>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _count_visible_text_length(text: str) -> int:
+        if not isinstance(text, str):
+            return 0
+        return len(re.sub(r"\s+", "", text))
+
+    @staticmethod
+    def _coerce_target_image_count(value) -> int:
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return 1
+        return max(1, count)
+
+    @staticmethod
+    def _normalize_prompt_signature(prompt: str) -> str:
+        if not isinstance(prompt, str):
+            return ""
+        return re.sub(r"\s+", " ", prompt).strip().casefold()
+
+    def _should_use_multi_image_mode(self, prompt_count: int) -> bool:
+        return prompt_count > 1 and (
+            self.multi_image_mode or self.target_image_count > 1
+        )
+
+    @staticmethod
+    def _normalize_lora_key(value) -> str:
+        if value is None:
+            return ""
+        return re.sub(r"\s+", "", str(value)).casefold()
+
+    def _parse_lora_pick_string(self, raw_text: str) -> list:
+        if not raw_text:
+            return []
+
+        selections = []
+        clear_token = self._normalize_lora_key("!clear_defaults")
+        for piece in re.split(r"[,;\n，；]+", raw_text):
+            token = piece.strip().strip("`").strip()
+            if not token:
+                continue
+
+            if self._normalize_lora_key(token) == clear_token:
+                selections.append({"name": "!clear_defaults", "control": "clear_defaults"})
+                continue
+
+            trigger_indexes = []
+            if "@" in token:
+                token, trigger_part = token.rsplit("@", 1)
+                for raw_index in re.split(r"[+|/、\s]+", trigger_part.strip()):
+                    raw_index = raw_index.strip()
+                    if not raw_index:
+                        continue
+                    try:
+                        index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if index > 0:
+                        trigger_indexes.append(index)
+
+            parts = [part.strip() for part in token.rsplit(":", 2)]
+            name = ""
+            strength = None
+            clip_strength = None
+
+            if len(parts) == 1:
+                name = parts[0]
+            elif len(parts) == 2:
+                name, strength = parts
+            else:
+                name, strength, clip_strength = parts
+
+            if not name:
+                continue
+
+            try:
+                strength = float(strength) if strength not in ("", None) else None
+            except (TypeError, ValueError):
+                strength = None
+
+            try:
+                clip_strength = float(clip_strength) if clip_strength not in ("", None) else None
+            except (TypeError, ValueError):
+                clip_strength = None
+
+            selections.append(
+                {
+                    "name": name,
+                    "strength": strength,
+                    "clip_strength": clip_strength,
+                    "trigger_indexes": trigger_indexes,
+                }
+            )
+
+        deduped = []
+        seen = set()
+        for item in selections:
+            key = self._normalize_lora_key(item.get("name") or item.get("control"))
+            if not key or key in seen:
+                continue
+            deduped.append(item)
+            seen.add(key)
+        return deduped
+
+    def _extract_lora_control_tags(self, text: str):
+        if not isinstance(text, str) or not text:
+            return text, []
+
+        collected = []
+
+        def repl(match):
+            collected.extend(self._parse_lora_pick_string(match.group(1)))
+            return ""
+
+        cleaned = re.sub(
+            r'<lora\s+picks="(.*?)"\s*/?>',
+            repl,
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        return cleaned, collected
+
+    @classmethod
+    def _find_pic_prompt_matches(cls, text: str) -> list[dict]:
+        if not isinstance(text, str) or not text:
+            return []
+
+        matches = []
+        occupied = []
+
+        for match in cls._PIC_PROMPT_TAG_PATTERN.finditer(text):
+            start, end = match.span()
+            matches.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "prompt": match.group("prompt") or "",
+                }
+            )
+            occupied.append((start, end))
+
+        for match in cls._PIC_PROMPT_UNCLOSED_PATTERN.finditer(text):
+            start, end = match.span()
+            if any(not (end <= s or start >= e) for s, e in occupied):
+                continue
+            matches.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "prompt": match.group("prompt") or "",
+                }
+            )
+
+        matches.sort(key=lambda item: item["start"])
+        return matches
+
+    @staticmethod
+    def _remove_text_spans(text: str, spans: list[tuple[int, int]]) -> str:
+        if not isinstance(text, str) or not spans:
+            return text
+
+        parts = []
+        cursor = 0
+        for start, end in spans:
+            parts.append(text[cursor:start])
+            cursor = end
+        parts.append(text[cursor:])
+        return "".join(parts)
+
+    def _extract_prompt_lora_pairs(self, full_text: str) -> list:
+        token_pattern = re.compile(
+            r'<lora\s+picks="(.*?)"\s*/?>',
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        tokens = []
+        for match in token_pattern.finditer(full_text or ""):
+            tokens.append(
+                {
+                    "type": "lora",
+                    "start": match.start(),
+                    "lora_raw": match.group(1) or "",
+                }
+            )
+        for match in self._find_pic_prompt_matches(full_text or ""):
+            tokens.append(
+                {
+                    "type": "pic",
+                    "start": match["start"],
+                    "prompt_raw": match["prompt"],
+                }
+            )
+        tokens.sort(key=lambda item: item["start"])
+
+        pairs = []
+        pending_loras = []
+        for token in tokens:
+            if token["type"] == "lora":
+                pending_loras.extend(self._parse_lora_pick_string(token["lora_raw"]))
+                continue
+
+            pairs.append(
+                {
+                    "prompt": token["prompt_raw"] or "",
+                    "lora_selections": pending_loras,
+                }
+            )
+            pending_loras = []
+
+        return pairs
+
+    def _format_lora_trigger_preview(self, entry: dict, limit: int = 3, preview_length: int = 60) -> str:
+        options = list(entry.get("trigger_options", []) or [])[:limit]
+        if not options:
+            if entry.get("is_style_lora"):
+                return "无触发词（更偏全局风格）"
+            return "无触发词"
+
+        rendered = []
+        for idx, option in enumerate(options, start=1):
+            text = re.sub(r"\s+", " ", str(option or "").strip()).strip(",; ")
+            if len(text) > preview_length:
+                text = text[: max(0, preview_length - 1)].rstrip() + "…"
+            rendered.append(f"[{idx}] {text}")
+        return " | ".join(rendered)
+
+    def _get_comfy_system_prompt(self) -> str:
+        llm_settings = self.config.get("llm_settings", {}) or {}
+        my_prompt = (llm_settings.get("system_prompt", "") or "").strip()
+        if not my_prompt:
+            return ""
+
+        if self.lora_control_enabled and getattr(self, "api", None):
+            try:
+                lora_appendix = self.api.get_lora_prompt_appendix()
+            except Exception as e:
+                logger.warning(f"[ComfyUI] 获取 LoRA prompt 附录失败: {e}")
+                lora_appendix = ""
+            if lora_appendix:
+                my_prompt = f"{my_prompt}\n\n{lora_appendix}".strip()
+        return my_prompt
+
+    @staticmethod
+    def _coerce_conversation_history(raw_history) -> list:
+        if raw_history is None:
+            return []
+
+        if isinstance(raw_history, str):
+            try:
+                raw_history = json.loads(raw_history)
+            except (json.JSONDecodeError, TypeError):
+                return []
+
+        if not isinstance(raw_history, list):
+            return []
+
+        return [copy.deepcopy(item) for item in raw_history if isinstance(item, dict)]
+
+    def _sanitize_context_content_for_prompt(self, content):
+        if isinstance(content, str):
+            return self._strip_comfy_control_tags(content, remove_think=True)
+
+        if not isinstance(content, list):
+            return content
+
+        sanitized_parts = []
+        for part in content:
+            if isinstance(part, str):
+                cleaned_part = self._strip_comfy_control_tags(part, remove_think=True)
+                if cleaned_part:
+                    sanitized_parts.append(cleaned_part)
+                continue
+
+            if not isinstance(part, dict):
+                sanitized_parts.append(copy.deepcopy(part))
+                continue
+
+            item = copy.deepcopy(part)
+            item_type = str(item.get("type", "") or "").strip().lower()
+            if item_type == "think":
+                continue
+
+            if item_type == "text":
+                if "text" in item:
+                    item["text"] = self._strip_comfy_control_tags(
+                        str(item.get("text", "") or ""),
+                        remove_think=True,
+                    )
+                    if not item["text"]:
+                        continue
+                elif isinstance(item.get("data"), dict):
+                    item["data"] = copy.deepcopy(item["data"])
+                    item["data"]["text"] = self._strip_comfy_control_tags(
+                        str(item["data"].get("text", "") or ""),
+                        remove_think=True,
+                    )
+                    if not item["data"]["text"]:
+                        continue
+
+            sanitized_parts.append(item)
+
+        return sanitized_parts
+
+    def _build_force_draw_contexts(
+        self,
+        conversation,
+        latest_reply_text: str,
+    ) -> list[dict]:
+        history = self._coerce_conversation_history(
+            getattr(conversation, "history", None),
+        )
+        sanitized_contexts = []
+
+        for entry in history[-self._FORCE_DRAW_CONTEXT_LIMIT :]:
+            message = copy.deepcopy(entry)
+            message["content"] = self._sanitize_context_content_for_prompt(
+                message.get("content"),
+            )
+            content = message.get("content")
+            if content in ("", None, []):
+                if not message.get("tool_calls") and not message.get("tool_call_id"):
+                    continue
+            sanitized_contexts.append(message)
+
+        latest_reply_text = self._strip_comfy_control_tags(
+            latest_reply_text,
+            remove_think=True,
+        )
+        if latest_reply_text:
+            should_append = True
+            if sanitized_contexts:
+                last_message = sanitized_contexts[-1]
+                if (
+                    last_message.get("role") == "assistant"
+                    and isinstance(last_message.get("content"), str)
+                    and last_message.get("content", "").strip() == latest_reply_text
+                ):
+                    should_append = False
+            if should_append:
+                sanitized_contexts.append(
+                    {"role": "assistant", "content": latest_reply_text},
+                )
+
+        return sanitized_contexts[-self._FORCE_DRAW_CONTEXT_LIMIT :]
+
+    def _extract_usable_prompt_entries(self, full_text: str) -> list[dict]:
+        prompt_entries = self._extract_prompt_lora_pairs(full_text)
+        if not prompt_entries:
+            return []
+
+        placeholder_patterns = [
+            r"^\.{2,}$",
+            r"^…+$",
+            r"^[.。]+$",
+            r"^[xX]{2,}$",
+            r"^[-_=]{2,}$",
+            r"^\[.*?\]$",
+            r"^\{.*?\}$",
+        ]
+
+        cleaned_entries = []
+        for entry in prompt_entries:
+            prompt_text = entry.get("prompt", "")
+            prompt_text = re.sub(r"^提示词是\s*[:：]?\s*", "", prompt_text).strip()
+            prompt_text = prompt_text.strip('`"\'""''').strip()
+            prompt_text, inline_loras = self._extract_lora_control_tags(prompt_text)
+            if not prompt_text:
+                continue
+            if len(prompt_text) < 3:
+                logger.debug(f"[ComfyUI] 跳过过短提示词: '{prompt_text}'")
+                continue
+            if any(re.match(pattern, prompt_text) for pattern in placeholder_patterns):
+                logger.debug(f"[ComfyUI] 跳过占位符提示词: '{prompt_text}'")
+                continue
+
+            lora_selections = []
+            seen_loras = set()
+            for item in (entry.get("lora_selections") or []) + inline_loras:
+                key = self._normalize_lora_key(item.get("name"))
+                if not key or key in seen_loras:
+                    continue
+                lora_selections.append(item)
+                seen_loras.add(key)
+
+            cleaned_entries.append(
+                {
+                    "prompt": prompt_text,
+                    "lora_selections": lora_selections,
+                }
+            )
+
+        return cleaned_entries
+
+    async def _generate_force_draw_prompt_entries(
+        self,
+        event: AstrMessageEvent,
+        latest_reply_text: str,
+        current_entries: list[dict] | None = None,
+    ) -> list[dict]:
+        if not self.force_draw_when_no_prompt:
+            return []
+
+        current_entries = list(current_entries or [])
+        current_count = len(current_entries)
+        missing_count = max(0, self.target_image_count - current_count)
+        needs_fill_when_no_prompt = current_count == 0 and missing_count > 0
+        needs_fill_to_target_count = missing_count > 0 and self.target_image_count > 1
+        if not needs_fill_when_no_prompt and not needs_fill_to_target_count:
+            return []
+
+        latest_reply_text = self._strip_comfy_control_tags(
+            latest_reply_text,
+            remove_think=True,
+        )
+        reply_length = self._count_visible_text_length(latest_reply_text)
+        if reply_length < self._FORCE_DRAW_MIN_REPLY_LENGTH:
+            logger.info(
+                "[ComfyUI] 跳过强制画图兜底：当前回复长度为 %s，小于阈值 %s",
+                reply_length,
+                self._FORCE_DRAW_MIN_REPLY_LENGTH,
+            )
+            return []
+
+        provider = self.context.get_using_provider(event.unified_msg_origin)
+        if provider is None:
+            logger.warning("[ComfyUI] 强制画图兜底失败：当前没有可用的聊天模型")
+            return []
+
+        conversation = None
+        try:
+            conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin,
+            )
+            if conversation_id:
+                conversation = await self.context.conversation_manager.get_conversation(
+                    event.unified_msg_origin,
+                    conversation_id,
+                )
+        except Exception as e:
+            logger.warning(f"[ComfyUI] 读取当前会话上下文失败，继续使用空上下文补提示词: {e}")
+
+        contexts = self._build_force_draw_contexts(conversation, latest_reply_text)
+        base_system_prompt = self._get_comfy_system_prompt()
+        latest_reply_excerpt = re.sub(r"\s+", " ", latest_reply_text).strip()
+        if len(latest_reply_excerpt) > 1200:
+            latest_reply_excerpt = latest_reply_excerpt[:1199].rstrip() + "…"
+        seen_prompts = {
+            self._normalize_prompt_signature(item.get("prompt", ""))
+            for item in current_entries
+            if item.get("prompt")
+        }
+        supplemented_entries = []
+        max_rounds = 2
+        remaining_count = missing_count
+
+        for round_idx in range(max_rounds):
+            if remaining_count <= 0:
+                break
+
+            existing_entries = current_entries + supplemented_entries
+            existing_prompt_summary = ""
+            if existing_entries:
+                rendered_existing = []
+                for item in existing_entries[:8]:
+                    prompt_text = re.sub(r"\s+", " ", str(item.get("prompt", "") or "")).strip()
+                    if not prompt_text:
+                        continue
+                    if len(prompt_text) > 180:
+                        prompt_text = prompt_text[:179].rstrip() + "…"
+                    rendered_existing.append(f"- {prompt_text}")
+                if rendered_existing:
+                    existing_prompt_summary = (
+                        "\n当前已经有以下图片提示词，补图时不要重复或近似重复这些画面：\n"
+                        + "\n".join(rendered_existing)
+                    )
+
+            if current_count == 0 and len(supplemented_entries) == 0:
+                shortage_text = (
+                    "上一轮回复没有产出可用的 <pic prompt=\"...\">。"
+                    if self.target_image_count == 1
+                    else f"上一轮回复没有产出可用的 <pic prompt=\"...\">，目标出图数量为 {self.target_image_count}。"
+                )
+            else:
+                shortage_text = (
+                    f"当前已经提取到 {current_count + len(supplemented_entries)} 个可用的 <pic prompt=\"...\">，"
+                    f"但目标出图数量是 {self.target_image_count}，还差 {remaining_count} 个。"
+                )
+
+            output_rule = (
+                f"1. 只输出 {remaining_count} 个 <pic prompt=\"...\">，不要输出 <think>、解释、正文、代码块或 Markdown；"
+            )
+            count_rule = (
+                f"3. 必须补足 {remaining_count} 张图，每个 <pic prompt=\"...\"> 对应一张不同的图，不要少于或多于该数量；"
+            )
+            fallback_prompt = (
+                "下面是最近的一条回复内容：\n"
+                f"{latest_reply_excerpt}\n\n"
+                f"请只基于上面这条最近回复内容，补齐剩余 {remaining_count} 张图。"
+                "只返回对应数量的 <pic prompt=\"...\"> 标签，可按换行分隔。如果有满足动作（如壁屄）或人物要求的lora，则直接使用lora，注意人物一致性"
+            )
+
+            force_draw_instruction = (
+                "你现在处于补图提示词模式。"
+                f"{shortage_text}"
+                f"{existing_prompt_summary}\n"
+                "硬性要求：\n"
+                f"{output_rule}\n"
+                "2. prompt 必须是适合 ComfyUI / Stable Diffusion / Danbooru 的英文 tags，半角逗号分隔；\n"
+                f"{count_rule}\n"
+                "4. 只能基于最近的一条回复内容来补图，不要参考更早的整体会话上下文；\n"
+                "5. 如果信息不足，就提炼最近一条回复里最值得定格的不同瞬间；\n"
+                "6. 不要输出占位符，不要留空，不要重复已有画面。"
+            )
+            system_prompt = (
+                f"{base_system_prompt}\n\n{force_draw_instruction}".strip()
+                if base_system_prompt
+                else force_draw_instruction
+            )
+
+            try:
+                response = await provider.text_chat(
+                    prompt=fallback_prompt,
+                    contexts=contexts,
+                    system_prompt=system_prompt,
+                )
+            except Exception as e:
+                logger.error(f"[ComfyUI] 强制画图补提示词请求失败: {e}")
+                logger.error(traceback.format_exc())
+                break
+
+            fallback_text = str(getattr(response, "completion_text", "") or "").strip()
+            if not fallback_text:
+                logger.warning("[ComfyUI] 强制画图补提示词返回空内容")
+                break
+
+            round_entries = self._extract_usable_prompt_entries(fallback_text)
+            if not round_entries:
+                logger.warning(
+                    "[ComfyUI] 强制画图补提示词后仍未提取到可用 prompt: %s",
+                    fallback_text[:160],
+                )
+                break
+
+            added_this_round = 0
+            for entry in round_entries:
+                prompt_signature = self._normalize_prompt_signature(entry.get("prompt", ""))
+                if not prompt_signature or prompt_signature in seen_prompts:
+                    continue
+                supplemented_entries.append(entry)
+                seen_prompts.add(prompt_signature)
+                added_this_round += 1
+                if len(supplemented_entries) >= missing_count:
+                    break
+
+            if added_this_round <= 0:
+                logger.warning("[ComfyUI] 强制画图补提示词返回的内容与已有 prompt 重复，停止补图")
+                break
+
+            remaining_count = max(0, missing_count - len(supplemented_entries))
+
+        if supplemented_entries:
+            logger.info(
+                "[ComfyUI] 🎯 强制画图补提示词成功，共补出 %s 张图",
+                len(supplemented_entries),
+            )
+        return supplemented_entries
 
     async def initialize(self):
         self.context.activate_llm_tool("comfyui_txt2img")
@@ -363,6 +1100,12 @@ class ComfyUIPlugin(Star):
         # 权限检查
         allowed, reason = self._check_access(event)
         if not allowed:
+            self._remember_draw_failure(
+                event,
+                reason,
+                prompt=self._extract_command_prompt(event),
+                source="用户指令",
+            )
             yield event.plain_result(reason)
             return
         
@@ -372,24 +1115,45 @@ class ComfyUIPlugin(Star):
             prompt = parts[1].strip() if len(parts) > 1 else ""
 
             if not prompt:
-                yield event.plain_result("❌ 请输入提示词，例如：/画图 1girl, smile")
+                message = "❌ 请输入提示词，例如：/画图 1girl, smile"
+                self._remember_draw_failure(event, message, source="用户指令")
+                yield event.plain_result(message)
                 return
 
             # 敏感词检查
-            passed, sensitive = self._check_sensitive(prompt, event)
+            prompt_to_check, _ = self._extract_lora_control_tags(prompt)
+            passed, sensitive = self._check_sensitive(prompt_to_check, event)
             if not passed:
                 tip = "、".join(sensitive[:5])  # 最多显示5个
                 extra = f"等 {len(sensitive)} 个" if len(sensitive) > 5 else ""
-                yield event.plain_result(f"🚫 检测到敏感词：{tip}{extra}，无法生成图片")
+                message = f"🚫 检测到敏感词：{tip}{extra}，无法生成图片"
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=prompt,
+                    source="用户指令",
+                )
+                yield event.plain_result(message)
                 return
 
+            event.set_extra("comfy_draw_source", "用户指令")
             async for result in self.comfyui_txt2img(event, prompt=prompt, direct_send=direct_send):
-                yield result
+                if isinstance(result, str):
+                    yield event.plain_result(result)
+                else:
+                    yield result
                 
         except Exception as e:
             logger.error(f"[ComfyUI] 绘图异常: {e}")
             logger.error(traceback.format_exc())
-            yield event.plain_result(f"❌ 执行出错：{str(e)[:50]}")
+            message = f"❌ 执行出错：{str(e)[:50]}"
+            self._remember_draw_failure(
+                event,
+                message,
+                prompt=self._extract_command_prompt(event),
+                source="用户指令",
+            )
+            yield event.plain_result(message)
     # ===== 探针：测试 event.send() 是否触发 on_decorating_result =====
     @filter.command("comfy_probe_send")
     async def cmd_probe_send(self, event: AstrMessageEvent):
@@ -808,7 +1572,7 @@ class ComfyUIPlugin(Star):
         # 排除 .steps.json 文件
         files = sorted([
             f.name for f in self.workflow_dir.glob("*.json") 
-            if not f.name.endswith(".steps.json")
+            if not self._is_workflow_aux_file(f.name)
         ])
     
         if not files:
@@ -869,7 +1633,7 @@ class ComfyUIPlugin(Star):
             # 排除 .steps.json 文件
             files = sorted([
                 f.name for f in self.workflow_dir.glob("*.json")
-                if not f.name.endswith(".steps.json")
+                if not self._is_workflow_aux_file(f.name)
             ])
         
             index = int(args[1])
@@ -1147,6 +1911,211 @@ class ComfyUIPlugin(Star):
         ]
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("测试lora", aliases=["lora_test", "lora测试"])
+    async def cmd_lora_test(self, event: AstrMessageEvent):
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            yield event.plain_result(reason)
+            return
+
+        if not getattr(self, "api", None):
+            yield event.plain_result("❌ ComfyUI 服务未连接，请先检查插件配置")
+            return
+
+        try:
+            context = self.api.get_lora_runtime_context()
+        except Exception as e:
+            yield event.plain_result(f"❌ 读取 LoRA 上下文失败: {e}")
+            return
+
+        if not context.get("supported"):
+            yield event.plain_result("⚠️ 当前工作流未检测到 LoRA 堆节点（Lora Loader / LoraManager）")
+            return
+
+        full_msg = (event.message_str or "").strip()
+        parts = full_msg.split(None, 1)
+        arg_text = parts[1].strip() if len(parts) > 1 else ""
+
+        catalog_entries = list(context.get("catalog", {}).values())
+        default_entries = list(context.get("default_active_loras", []))
+        workflow_name = getattr(self.api, "wf_filename", "未知")
+        scan_roots = context.get("scan_roots", [])
+        lora_enabled = "开启" if self.lora_control_enabled else "关闭"
+
+        if not arg_text or arg_text.lower() in ("help", "status", "状态", "帮助"):
+            default_names = ", ".join(item.get("display_name", "") for item in default_entries) or "无"
+            lines = [
+                "🧪 LoRA 测试命令",
+                "━━━━━━━━━━━━━━━━━━",
+                f"当前工作流: {workflow_name}",
+                f"LoRA 控制功能: {lora_enabled}",
+                f"已识别 LoRA 数量: {len(catalog_entries)}",
+                f"默认启用 LoRA: {default_names}",
+            ]
+            if scan_roots:
+                lines.append("扫描目录:")
+                lines.extend(f"- {root}" for root in scan_roots)
+            lines.extend(
+                [
+                    "━━━━━━━━━━━━━━━━━━",
+                    "用法示例:",
+                    "/测试lora 列表",
+                    "/测试lora 列表 菲比",
+                    "/测试lora QAQ1121-24:0.8",
+                    "/测试lora !clear_defaults, 菲比 鸣潮:0.8@1",
+                    '/测试lora <lora picks="!clear_defaults, QAQ1121-24:0.8@1+2">',
+                    "说明:",
+                    "- @1 / @1+2 表示选该 LoRA 的第 1 个或第 1+2 个触发词候选",
+                    "- !clear_defaults 表示本次禁用工作流默认 LoRA",
+                    "- 如果用了 @序号，系统会自动注入对应触发词，<pic prompt> 里不要再手抄同一串角色/外观 tags",
+                    "- 这个命令只做解析预演，不会真的出图",
+                ]
+            )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        arg_lower = arg_text.lower()
+        if arg_lower == "列表" or arg_lower.startswith("列表 ") or arg_lower == "list" or arg_lower.startswith("list "):
+            keyword = ""
+            tokens = arg_text.split(None, 1)
+            if len(tokens) > 1:
+                keyword = tokens[1].strip()
+
+            if keyword:
+                normalized_keyword = self._normalize_lora_key(keyword)
+                matched = []
+                for entry in catalog_entries:
+                    search_fields = [
+                        entry.get("display_name", ""),
+                        entry.get("workflow_name", ""),
+                        entry.get("loader_name", ""),
+                        entry.get("model_name", ""),
+                    ] + list(entry.get("aliases", []))
+                    if any(normalized_keyword in self._normalize_lora_key(value) for value in search_fields if value):
+                        matched.append(entry)
+            else:
+                matched = catalog_entries
+
+            if not matched:
+                yield event.plain_result(f"🔍 没找到匹配的 LoRA: {keyword}")
+                return
+
+            limit = 20
+            lines = [
+                "📚 LoRA 列表",
+                "━━━━━━━━━━━━━━━━━━",
+                f"工作流: {workflow_name}",
+                f"匹配数量: {len(matched)}",
+            ]
+            if len(matched) > limit:
+                lines.append(f"仅展示前 {limit} 个结果")
+            for entry in matched[:limit]:
+                strength_text = self.api._format_lora_strength(entry.get("default_strength", 1.0))
+                clip_text = self.api._format_lora_strength(
+                    entry.get("default_clip_strength", entry.get("default_strength", 1.0))
+                )
+                status_text = "默认启用" if entry.get("default_active") else "可选"
+                lines.append(
+                    f"- {entry.get('display_name')} | {status_text} | 默认强度 {strength_text}/{clip_text}"
+                )
+                lines.append(
+                    f"  触发词: {self._format_lora_trigger_preview(entry, limit=getattr(self.api, 'max_trigger_options_per_lora', 3))}"
+                )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        parse_text = arg_text
+        if arg_lower.startswith("解析 "):
+            parse_text = arg_text.split(None, 1)[1].strip()
+        elif arg_lower.startswith("test "):
+            parse_text = arg_text.split(None, 1)[1].strip()
+
+        if "<lora" in parse_text.lower():
+            _, parsed = self._extract_lora_control_tags(parse_text)
+        else:
+            parsed = self._parse_lora_pick_string(parse_text)
+
+        if not parsed:
+            yield event.plain_result(
+                "❌ 没解析到任何 LoRA 选择\n"
+                "示例: /测试lora QAQ1121-24:0.8\n"
+                "示例: /测试lora !clear_defaults, 菲比 鸣潮:0.8@1"
+            )
+            return
+
+        resolved = self.api.resolve_lora_selections(parsed)
+        preview_prompt, injected_hints = self.api._inject_selected_lora_prompt_hints(
+            "1girl, masterpiece", resolved
+        )
+        clear_defaults = any(item.get("control") == "clear_defaults" for item in parsed)
+
+        parsed_names = [
+            str(item.get("name", "")).strip()
+            for item in parsed
+            if item.get("control") != "clear_defaults" and str(item.get("name", "")).strip()
+        ]
+        resolved_names = {
+            str(item.get("requested_name", "")).strip()
+            for item in resolved
+            if item.get("control") != "clear_defaults"
+        }
+        unresolved_names = [name for name in parsed_names if name not in resolved_names]
+
+        lines = [
+            "🧪 LoRA 解析预演",
+            "━━━━━━━━━━━━━━━━━━",
+            f"工作流: {workflow_name}",
+            f"默认 LoRA 处理: {'本次清空' if clear_defaults else '保持默认行为'}",
+            f"原始输入: {parse_text}",
+            "",
+            "解析结果:",
+        ]
+
+        for item in parsed:
+            if item.get("control") == "clear_defaults":
+                lines.append("- !clear_defaults")
+                continue
+            trigger_indexes = item.get("trigger_indexes", []) or []
+            trigger_text = f" @ {'+'.join(map(str, trigger_indexes))}" if trigger_indexes else ""
+            lines.append(
+                f"- {item.get('name')} | 强度 {item.get('strength')} / {item.get('clip_strength')}{trigger_text}"
+            )
+
+        lines.append("")
+        lines.append("命中结果:")
+
+        for item in resolved:
+            if item.get("control") == "clear_defaults":
+                lines.append("- 本次会清空工作流默认 LoRA")
+                continue
+
+            strength_text = self.api._format_lora_strength(item.get("strength", 1.0))
+            clip_text = self.api._format_lora_strength(item.get("clip_strength", item.get("strength", 1.0)))
+            trigger_indexes = item.get("trigger_indexes", []) or []
+            trigger_index_text = "+".join(map(str, trigger_indexes)) if trigger_indexes else "无"
+            lines.append(
+                f"- {item.get('display_name')} | 实际载入名 {item.get('name')} | 强度 {strength_text}/{clip_text} | 触发词编号 {trigger_index_text}"
+            )
+            selected_hints = item.get("selected_prompt_hints", []) or []
+            if selected_hints:
+                preview = " | ".join(
+                    re.sub(r"\s+", " ", str(text).strip())[:80] + ("…" if len(re.sub(r'\s+', ' ', str(text).strip())) > 80 else "")
+                    for text in selected_hints[:3]
+                )
+                lines.append(f"  注入提示: {preview}")
+
+        if unresolved_names:
+            lines.append("")
+            lines.append("未命中:")
+            lines.extend(f"- {name}" for name in unresolved_names)
+
+        if injected_hints:
+            lines.append("")
+            lines.append("提示词注入预览:")
+            lines.append(f"- {preview_prompt[:300]}{'…' if len(preview_prompt) > 300 else ''}")
+
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("重绘", aliases=["重抽", "reroll"])
     async def cmd_reroll(self, event: AstrMessageEvent):
         full_msg = (event.message_str or "").strip()
@@ -1285,53 +2254,28 @@ class ComfyUIPlugin(Star):
             return
     
         full_text = resp.completion_text
-    
-        # 提取所有 <pic prompt="...">
-        prompts = re.findall(r'<pic\s+prompt="(.*?)">', full_text, flags=re.DOTALL)
-    
-        if not prompts:
+        cleaned_text = self._strip_comfy_control_tags(full_text, remove_think=True)
+        cleaned_entries = self._extract_usable_prompt_entries(full_text)
+        supplemented_entries = await self._generate_force_draw_prompt_entries(
+            event,
+            cleaned_text,
+            cleaned_entries,
+        )
+        if supplemented_entries:
+            cleaned_entries = cleaned_entries + supplemented_entries
+        if not cleaned_entries:
             return
 
         # 清理文本供其他插件使用（移除 <pic>、<think>、<ctx> 标签）
-        cleaned_text = re.sub(r'<pic\s+prompt=".*?">', '', full_text, flags=re.DOTALL)
-        cleaned_text = re.sub(r'<think>.*?</think>', '', cleaned_text, flags=re.DOTALL)
-        cleaned_text = re.sub(r'</?ctx>', '', cleaned_text)
-        cleaned_text = cleaned_text.strip()
         event.set_extra("comfy_cleaned_text", cleaned_text)
-    
-        # 清理提示词内容
-        cleaned_prompts = []
-        
-        placeholder_patterns = [
-            r'^\.{2,}$',
-            r'^…+$',
-            r'^[.。]+$',
-            r'^[xX]{2,}$',
-            r'^[-_=]{2,}$',
-            r'^\[.*?\]$',
-            r'^\{.*?\}$',
-        ]
-        
-        for p in prompts:
-            p = re.sub(r'^提示词是\s*[:：]?\s*', '', p).strip()
-            p = p.strip('`"\'""''').strip()
-            if not p:
-                continue
-            if len(p) < 3:
-                logger.debug(f"[ComfyUI] 跳过过短提示词: '{p}'")
-                continue
-            is_placeholder = any(re.match(pat, p) for pat in placeholder_patterns)
-            if is_placeholder:
-                logger.debug(f"[ComfyUI] 跳过占位符提示词: '{p}'")
-                continue
-            cleaned_prompts.append(p)
 
-        if not cleaned_prompts:
-            return
+        cleaned_prompts = [item["prompt"] for item in cleaned_entries]
+        use_multi_image_mode = self._should_use_multi_image_mode(len(cleaned_entries))
     
         # 单图模式
-        if len(cleaned_prompts) == 1:
-            event._comfy_extracted_prompt = cleaned_prompts[0]
+        if not use_multi_image_mode:
+            event._comfy_extracted_prompt = cleaned_entries[0]["prompt"]
+            event._comfy_extracted_loras = cleaned_entries[0].get("lora_selections", [])
             logger.info(f"[ComfyUI] 📝 检测到单图模式: {cleaned_prompts[0][:50]}...")
             # 丢弃绘图提示词，避免污染历史记录上下文
             if self.discard_prompt_from_history:
@@ -1341,8 +2285,14 @@ class ComfyUIPlugin(Star):
             return
     
         # 多图模式
-        if self.multi_image_mode:
-            parts = re.split(r'<pic\s+prompt=".*?">', full_text, flags=re.DOTALL)
+        if use_multi_image_mode:
+            pic_matches = self._find_pic_prompt_matches(full_text)
+            parts = []
+            cursor = 0
+            for item in pic_matches:
+                parts.append(full_text[cursor:item["start"]])
+                cursor = item["end"]
+            parts.append(full_text[cursor:])
         
             # 检测原始文本中的 <render> 标签信息，用于补全被切割的段落
             render_match = re.search(r'<render\b[^>]*>', full_text)
@@ -1355,6 +2305,8 @@ class ComfyUIPlugin(Star):
             for i, text in enumerate(parts):
                 text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
                 text = re.sub(r'</?ctx>', '', text)
+                text = re.sub(r'</pic>', '', text, flags=re.IGNORECASE)
+                text = re.sub(r'<lora\s+picks=".*?"\s*/?>', '', text, flags=re.DOTALL | re.IGNORECASE)
                 text = text.strip()
                 if text:
                     # 如果原文使用了 <render> 标签，确保每个文本段都有完整的标签对
@@ -1369,8 +2321,24 @@ class ComfyUIPlugin(Star):
                             text = render_open_tag + text + render_close_tag
                     segments.append({"type": "text", "content": text})
                 if prompt_idx < len(cleaned_prompts):
-                    segments.append({"type": "prompt", "content": cleaned_prompts[prompt_idx]})
+                    segments.append(
+                        {
+                            "type": "prompt",
+                            "content": cleaned_prompts[prompt_idx],
+                            "lora_selections": cleaned_entries[prompt_idx].get("lora_selections", []),
+                        }
+                    )
                     prompt_idx += 1
+
+            while prompt_idx < len(cleaned_prompts):
+                segments.append(
+                    {
+                        "type": "prompt",
+                        "content": cleaned_prompts[prompt_idx],
+                        "lora_selections": cleaned_entries[prompt_idx].get("lora_selections", []),
+                    }
+                )
+                prompt_idx += 1
         
             if segments:
                 event._comfy_segments = segments
@@ -1392,13 +2360,25 @@ class ComfyUIPlugin(Star):
         segments = getattr(event, "_comfy_segments", None)
 
         # === 多图分段模式：构建带标记的 chain，交给 HtmlRender 渲染后由 priority=10 发送 ===
-        if segments and self.multi_image_mode:
+        if segments and self._should_use_multi_image_mode(
+            sum(1 for item in segments if item.get("type") == "prompt"),
+        ):
             event._comfy_auto_painted = True
 
             # 权限检查
             allowed, reason = self._check_access(event)
             if not allowed:
                 logger.warning(f"[ComfyUI] 多图请求被拒绝: {reason}")
+                self._remember_draw_failure(
+                    event,
+                    reason,
+                    prompt=[
+                        item.get("content", "")
+                        for item in segments
+                        if item.get("type") == "prompt"
+                    ],
+                    source="LLM 自动多图",
+                )
                 try:
                     await event.send(event.plain_result(reason))
                 except Exception as e:
@@ -1409,8 +2389,19 @@ class ComfyUIPlugin(Star):
             ok, remain = self._check_cooldown(event)
             if not ok:
                 logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中")
+                message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=[
+                        item.get("content", "")
+                        for item in segments
+                        if item.get("type") == "prompt"
+                    ],
+                    source="LLM 自动多图",
+                )
                 try:
-                    await event.send(event.plain_result(f"⏱️ 冷却中，请在 {remain} 秒后重试"))
+                    await event.send(event.plain_result(message))
                 except Exception as e:
                     logger.error(f"[ComfyUI] 发送冷却提示失败: {e}")
                 return
@@ -1422,8 +2413,15 @@ class ComfyUIPlugin(Star):
                     if not passed:
                         tip = "、".join(sensitive[:3])
                         logger.warning(f"[ComfyUI] 多图模式触发敏感词: {tip}")
+                        message = f"🚫 检测到敏感词：{tip}，无法生成图片"
+                        self._remember_draw_failure(
+                            event,
+                            message,
+                            prompt=s["content"],
+                            source="LLM 自动多图",
+                        )
                         try:
-                            await event.send(event.plain_result(f"🚫 检测到敏感词：{tip}，无法生成图片"))
+                            await event.send(event.plain_result(message))
                         except Exception as e:
                             logger.error(f"[ComfyUI] 发送敏感词提示失败: {e}")
                         return
@@ -1440,7 +2438,13 @@ class ComfyUIPlugin(Star):
                     new_chain.append(Plain(segment["content"]))
                 elif segment["type"] == "prompt":
                     img_idx += 1
-                    new_chain.append(_ComfyImageMarker(segment["content"], img_idx))
+                    new_chain.append(
+                        _ComfyImageMarker(
+                            segment["content"],
+                            img_idx,
+                            segment.get("lora_selections", []),
+                        )
+                    )
 
             result.chain = new_chain
             event.set_extra("comfy_multi_image_mode", True)
@@ -1460,6 +2464,12 @@ class ComfyUIPlugin(Star):
         allowed, reason = self._check_access(event)
         if not allowed:
             logger.warning(f"[ComfyUI] 单图请求被拒绝: {reason}")
+            self._remember_draw_failure(
+                event,
+                reason,
+                prompt=prompt,
+                source="LLM 自动绘图",
+            )
             try:
                 await event.send(event.plain_result(reason))
             except Exception as e:
@@ -1471,8 +2481,15 @@ class ComfyUIPlugin(Star):
         if not passed:
             tip = "、".join(sensitive[:5])
             logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
+            message = f"🚫 检测到敏感词：{tip}，无法生成图片"
+            self._remember_draw_failure(
+                event,
+                message,
+                prompt=prompt,
+                source="LLM 自动绘图",
+            )
             try:
-                await event.send(event.plain_result(f"🚫 检测到敏感词：{tip}，无法生成图片"))
+                await event.send(event.plain_result(message))
             except Exception as e:
                 logger.error(f"[ComfyUI] 发送敏感词提示失败: {e}")
             return
@@ -1481,30 +2498,57 @@ class ComfyUIPlugin(Star):
         ok, remain = self._check_cooldown(event)
         if not ok:
             logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中，图片跳过")
+            message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
+            self._remember_draw_failure(
+                event,
+                message,
+                prompt=prompt,
+                source="LLM 自动绘图",
+            )
             try:
-                await event.send(event.plain_result(f"⏱️ 冷却中，请在 {remain} 秒后重试"))
+                await event.send(event.plain_result(message))
             except Exception as e:
                 logger.error(f"[ComfyUI] 发送冷却提示失败: {e}")
             return
 
         # 不修改 result.chain → 文字由框架/HtmlRender 正常发送
         # 图片异步生成后单独发送
-        asyncio.create_task(self._send_image_async(event, prompt))
+        asyncio.create_task(
+            self._send_image_async(
+                event,
+                prompt,
+                getattr(event, "_comfy_extracted_loras", []),
+            )
+        )
     
-    async def _send_image_async(self, event: AstrMessageEvent, prompt: str):
+    async def _send_image_async(self, event: AstrMessageEvent, prompt: str, lora_selections=None):
         """异步生成并发送图片（不阻塞文字消息发送）"""
         try:
             if not getattr(self, 'api', None):
-                logger.error("[ComfyUI] API 未初始化，无法生成图片")
+                message = "❌ ComfyUI API 未初始化，无法生成图片"
+                logger.error(f"[ComfyUI] {message}")
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=prompt,
+                    source="LLM 自动绘图",
+                )
                 return
 
             logger.info(f"[ComfyUI] 🎨 异步生成开始 | Prompt: {prompt[:50]}...")
-            img_data, error_msg = await self.api.generate(prompt)
+            img_data, error_msg = await self.api.generate(prompt, lora_selections=lora_selections)
 
             if not img_data:
+                message = f"❌ 图片生成失败：{error_msg}"
                 logger.error(f"[ComfyUI] 异步生成失败: {error_msg}")
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=prompt,
+                    source="LLM 自动绘图",
+                )
                 try:
-                    await event.send(event.plain_result(f"❌ 图片生成失败：{error_msg}"))
+                    await event.send(event.plain_result(message))
                 except Exception as e:
                     logger.error(f"[ComfyUI] 发送失败消息异常: {e}")
                 return
@@ -1518,11 +2562,18 @@ class ComfyUIPlugin(Star):
 
             image_component = Image.fromFileSystem(str(img_path))
             await event.send(event.chain_result([image_component]))
+            self._clear_draw_failures(event)
             logger.info(f"[ComfyUI] 📤 异步图片已发送: {img_filename}")
 
         except Exception as e:
             logger.error(f"[ComfyUI] 异步绘图异常: {e}")
             logger.error(traceback.format_exc())
+            self._remember_draw_failure(
+                event,
+                f"❌ 异步绘图异常：{str(e)[:50]}",
+                prompt=prompt,
+                source="LLM 自动绘图",
+            )
     @filter.on_decorating_result(priority=5)
     async def _cleanup_history_prompts(self, event: AstrMessageEvent):
         """在所有处理完成后，直接从对话历史中移除绘图提示词"""
@@ -1556,9 +2607,9 @@ class ComfyUIPlugin(Star):
                 if entry.get("role") != "assistant":
                     continue
                 content = str(entry.get("content", ""))
-                cleaned = re.sub(r'<pic\s+prompt=".*?">', '', content, flags=re.DOTALL)
-                if cleaned != content:
-                    entry["content"] = cleaned.strip()
+                cleaned = self._strip_comfy_control_tags(content, remove_think=True)
+                if cleaned != content.strip():
+                    entry["content"] = cleaned
                     modified = True
 
             if modified:
@@ -1599,6 +2650,8 @@ class ComfyUIPlugin(Star):
         if current_group:
             groups.append({"items": current_group, "marker": None})
 
+        self._clear_draw_failures(event)
+
         # 逐组发送
         for group in groups:
             items = group["items"]
@@ -1619,12 +2672,23 @@ class ComfyUIPlugin(Star):
             if marker:
                 try:
                     logger.info(f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 开始生成: {marker.prompt[:50]}...")
-                    img_data, error_msg = await self.api.generate(marker.prompt)
+                    img_data, error_msg = await self.api.generate(
+                        marker.prompt,
+                        lora_selections=marker.lora_selections,
+                    )
 
                     if not img_data:
+                        message = f"❌ [图片{marker.index}] 生成失败：{error_msg}"
                         logger.error(f"[ComfyUI] 图片 {marker.index} 生成失败: {error_msg}")
+                        self._remember_draw_failure(
+                            event,
+                            message,
+                            prompt=marker.prompt,
+                            source=f"LLM 多图 图片{marker.index}",
+                            append=True,
+                        )
                         try:
-                            await event.send(event.plain_result(f"❌ [图片{marker.index}] 生成失败：{error_msg}"))
+                            await event.send(event.plain_result(message))
                         except:
                             pass
                         continue
@@ -1640,6 +2704,13 @@ class ComfyUIPlugin(Star):
                 except Exception as e:
                     logger.error(f"[ComfyUI] 图片 {marker.index} 处理异常: {e}")
                     logger.error(traceback.format_exc())
+                    self._remember_draw_failure(
+                        event,
+                        f"❌ [图片{marker.index}] 处理异常：{str(e)[:50]}",
+                        prompt=marker.prompt,
+                        source=f"LLM 多图 图片{marker.index}",
+                        append=True,
+                    )
 
         # 清空 chain，防止框架重复发送
         result.chain.clear()
@@ -1647,11 +2718,18 @@ class ComfyUIPlugin(Star):
     @llm_tool(name="comfyui_txt2img")
     async def comfyui_txt2img(self, event: AstrMessageEvent, ctx: Context = None, prompt: str = None, text: str = None, img_width: int = None, img_height: int = None, direct_send: bool = False) -> MessageEventResult:
         """ComfyUI 文生图工具"""
+        draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
         
         # 权限检查
         allowed, reason = self._check_access(event)
         if not allowed:
-            yield event.plain_result(reason)
+            self._remember_draw_failure(
+                event,
+                reason,
+                prompt=prompt or text or self._extract_command_prompt(event),
+                source=draw_source,
+            )
+            yield reason  # 以字符串形式返回，让 AI 能在 tool 上下文中看到拒绝原因
             return
 
         # 参数处理
@@ -1659,44 +2737,77 @@ class ComfyUIPlugin(Star):
             prompt = text
 
         if not prompt:
-            yield event.plain_result("❌ 未提供 prompt，请重试")
+            message = "❌ 未提供 prompt，请重试"
+            self._remember_draw_failure(event, message, source=draw_source)
+            yield message
             return
 
         if not isinstance(prompt, str) or not prompt.strip():
             raw = getattr(event, "message_str", "") or ""
             prompt = re.sub(r'```math\s*At:\d+```\s*', '', raw).strip()
             if not prompt:
-                yield event.plain_result("❌ 请输入提示词")
+                message = "❌ 请输入提示词"
+                self._remember_draw_failure(event, message, source=draw_source)
+                yield message
                 return
 
         # API 检查
         if not getattr(self, 'api', None):
-            yield event.plain_result("❌ ComfyUI 服务未连接，请检查配置")
+            message = "❌ ComfyUI 服务未连接，请检查配置"
+            self._remember_draw_failure(
+                event,
+                message,
+                prompt=prompt,
+                source=draw_source,
+            )
+            yield message
             return
         
         try:
             # 敏感词检查
+            prompt, lora_selections = self._extract_lora_control_tags(prompt)
             passed, sensitive = self._check_sensitive(prompt, event)
             if not passed:
                 tip = "、".join(sensitive[:5])
                 logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
-                yield event.plain_result(f"🚫 检测到敏感词：{tip}，无法生成")
+                message = f"🚫 检测到敏感词：{tip}，无法生成"
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=prompt,
+                    source=draw_source,
+                )
+                yield message
                 return
 
             # 冷却检查
             ok, remain = self._check_cooldown(event)
             if not ok:
-                yield event.plain_result(f"⏱️ 冷却中，请在 {remain} 秒后重试")
+                message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=prompt,
+                    source=draw_source,
+                )
+                yield message
                 return
 
             logger.info(f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt[:50]}...")
 
             # 调用 API
-            img_data, error_msg = await self.api.generate(prompt)
+            img_data, error_msg = await self.api.generate(prompt, lora_selections=lora_selections)
 
             if not img_data:
                 logger.error(f"[ComfyUI] 生成失败: {error_msg}")
-                yield event.plain_result(f"❌ 生成失败：{error_msg}")
+                message = f"❌ 生成失败：{error_msg}"
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=prompt,
+                    source=draw_source,
+                )
+                yield message
                 return
 
             # 保存图片
@@ -1706,6 +2817,7 @@ class ComfyUIPlugin(Star):
                 fp.write(img_data)
             
             logger.info(f"[ComfyUI] ✅ 图片已保存: {img_filename}")
+            self._clear_draw_failures(event)
 
             # 发送结果
             if direct_send:
@@ -1724,4 +2836,11 @@ class ComfyUIPlugin(Star):
         except Exception as e:
             logger.error(f"[ComfyUI] 执行异常: {e}")
             logger.error(traceback.format_exc())
-            yield event.plain_result(f"❌ 内部错误: {str(e)[:50]}")
+            message = f"❌ 内部错误: {str(e)[:50]}"
+            self._remember_draw_failure(
+                event,
+                message,
+                prompt=prompt,
+                source=draw_source,
+            )
+            yield message
