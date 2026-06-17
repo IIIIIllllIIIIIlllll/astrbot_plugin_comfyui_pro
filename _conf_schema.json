@@ -1,49 +1,13 @@
 {
-  "server_address": {
-    "description": "ComfyUI 服务端 IP、端口",
-    "type": "string",
-    "hint": "请确保 ComfyUI 已启动并允许 API 访问",
-    "obvious_hint": true,
-    "default": "127.0.0.1:8188"
+  "servers": {
+    "description": "ComfyUI 服务端配置，每行一个。\n格式：id;IP:端口\nid 为数字标识，0 号固定为默认服务器。\n示例：\n0;127.0.0.1:8188\n1;192.168.1.200:8188",
+    "type": "text",
+    "default": "0;127.0.0.1:8188"
   },
-  "workflow_settings": {
-    "description": "ComfyUI 工作流节点配置",
-    "type": "object",
-    "items": {
-      "json_file": {
-        "description": "工作流文件名 (自动扫描 workflow 目录)",
-        "type": "string",
-        "default": "workflow_api.json",
-        "options": [
-          "workflow_api.json"
-        ],
-        "enum": [
-          "workflow_api.json"
-        ]
-      },
-      "input_node_id": {
-        "title": "正面提示词节点 ID",
-        "description": "正面提示词的节点 ID",
-        "type": "string",
-        "hint": "通常是连接到 KSampler 'positive' 输入端的 CLIP Text Encode 节点",
-        "default": "6",
-        "obvious_hint": true
-      },
-      "neg_node_id": {
-        "title": "负面提示词节点 ID",
-        "description": "负面提示词的节点 ID",
-        "type": "string",
-        "hint": "通常是连接到 KSampler 'negative' 输入端的 CLIP Text Encode 节点，如果没有这个，可以乱填比如10000",
-        "default": "7",
-        "obvious_hint": true
-      },
-      "output_node_id": {
-        "description": "图片输出节点 ID (Image)",
-        "type": "string",
-        "hint": "留空则自动寻找第一个包含图片的输出节点",
-        "default": ""
-      }
-    }
+  "workflows": {
+    "description": "ComfyUI 工作流配置，每行一个。\n格式：id;工作流文件;正面节点ID;负面节点ID;输出节点ID;服务器ID\nid 为数字标识，0 号固定为默认工作流。负面节点ID、输出节点ID和服务器ID可留空。服务器ID留空则使用 0 号服务器。\n示例：\n0;workflow_api.json;6;7;;0\n1;workflow_sdxl.json;56;57;9;1",
+    "type": "text",
+    "default": "0;workflow_api.json;6;7;;0"
   },
   "queue_delay_messages": {
     "description": "队列提示消息，每行一条。{n} 会被替换为待处理任务数。留空使用默认消息。",

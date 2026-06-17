@@ -28,6 +28,7 @@ class DrawTask:
     event: AstrMessageEvent
     prompt: str
     direct_send: bool
+    override_wf_id: int | None = None
 
 
 @register(
@@ -67,8 +68,6 @@ class ComfyUIPlugin(Star):
         self.workflow_dir = self.data_dir / "workflow"
         self.output_dir = self.data_dir / "output"
         self.sensitive_words_path = self.data_dir / "sensitive_words.json"
-
-        self._auto_update_schema()
 
         control_conf = config.get("control", {})
         self.cooldown_seconds = control_conf.get("cooldown_seconds", 60)
@@ -199,29 +198,6 @@ class ComfyUIPlugin(Star):
             except Exception as e:
                 logger.error(f"[ComfyUI] 复制敏感词文件失败: {e}")
 
-    def _auto_update_schema(self):
-        try:
-            schema_path = PLUGIN_DIR / '_conf_schema.json'
-            workflow_dir = self.data_dir / 'workflow'
-            if not workflow_dir.exists():
-                return
-            files = sorted([
-                f.name for f in workflow_dir.glob("*.json")
-                if not self._is_workflow_aux_file(f.name)
-            ])
-            if not files:
-                files = ["workflow_api.json"]
-            with open(schema_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            target = data['workflow_settings']['items']['json_file']
-            target['options'] = files
-            target['enum'] = files
-            with open(schema_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            logger.info(f"[ComfyUI] 🔄 工作流列表已更新: {len(files)} 个可用")
-        except Exception as e:
-            logger.error(f"[ComfyUI] 更新工作流列表失败: {e}")
-
     def _check_access(self, event: AstrMessageEvent) -> tuple:
         user_id = str(event.get_sender_id())
         is_admin = user_id in self.admin_user_ids
@@ -268,10 +244,6 @@ class ComfyUIPlugin(Star):
         parts = full_message.split(None, 1)
         return parts[1].strip() if len(parts) > 1 else ""
 
-    @staticmethod
-    def _is_workflow_aux_file(filename: str) -> bool:
-        return filename.endswith(".steps.json") or filename.endswith(".lora.json")
-
     async def initialize(self):
         self._queue_worker_task = asyncio.create_task(self._queue_worker())
         logger.info("[ComfyUI] 🎨 插件初始化完成")
@@ -286,7 +258,22 @@ class ComfyUIPlugin(Star):
         try:
             full_message = event.message_str.strip()
             parts = full_message.split(' ', 1)
-            prompt = parts[1].strip() if len(parts) > 1 else ""
+            remaining = parts[1].strip() if len(parts) > 1 else ""
+
+            override_wf_id = None
+            prompt = remaining
+            if remaining:
+                first_token = remaining.split(' ', 1)[0]
+                try:
+                    wf_id = int(first_token)
+                    if getattr(self, 'api', None) and wf_id in self.api.workflows:
+                        override_wf_id = wf_id
+                        prompt = remaining.split(' ', 1)[1].strip() if ' ' in remaining else ""
+                    elif getattr(self, 'api', None):
+                        yield event.plain_result(f"❌ 工作流 ID {wf_id} 不存在，可用 ID: {sorted(self.api.workflows.keys())}")
+                        return
+                except ValueError:
+                    prompt = remaining
 
             if not prompt:
                 message = "❌ 请输入提示词，例如：/画图 1girl, smile"
@@ -317,7 +304,7 @@ class ComfyUIPlugin(Star):
                     random.choice(self.queue_delay_messages).format(n=n_ahead)
                 ))
             await self._draw_queue.put(DrawTask(
-                event=event, prompt=prompt, direct_send=direct_send
+                event=event, prompt=prompt, direct_send=direct_send, override_wf_id=override_wf_id
             ))
 
         except Exception as e:
@@ -340,9 +327,9 @@ class ComfyUIPlugin(Star):
             return
 
         try:
-            logger.info(f"[ComfyUI] 🎨 开始生成 | 用户: {task.event.get_sender_id()} | Prompt: {task.prompt[:50]}...")
+            logger.info(f"[ComfyUI] 🎨 开始生成 | 用户: {task.event.get_sender_id()} | Workflow: {task.override_wf_id or 'default'} | Prompt: {task.prompt[:50]}...")
 
-            img_data, error_msg, final_prompt = await self.api.generate(task.prompt)
+            img_data, error_msg, final_prompt = await self.api.generate(task.prompt, override_wf_id=task.override_wf_id)
 
             if not img_data:
                 logger.error(f"[ComfyUI] 生成失败: {error_msg}")
@@ -406,7 +393,7 @@ class ComfyUIPlugin(Star):
             tips.extend([
                 "【管理员指令】 👑",
                 "  /comfy_ls              列出所有工作流",
-                "  /comfy_use <序号>      切换工作流",
+                "  /comfy_use <ID>       切换默认工作流",
                 "  /comfy_save            导入新工作流",
                 "  /comfy_add             步数覆盖（按节点ID）",
                 "  /comfy_lock on|off     切换全局锁定",
@@ -513,45 +500,23 @@ class ComfyUIPlugin(Star):
             yield event.plain_result("🚫 权限不足，仅管理员可查看工作流列表")
             return
 
-        if not self.workflow_dir.exists():
-            yield event.plain_result("❌ 工作流目录不存在")
+        if not self.api or not self.api.workflows:
+            yield event.plain_result("📂 未配置工作流，请在插件设置中填写 workflows")
             return
 
-        files = sorted([
-            f.name for f in self.workflow_dir.glob("*.json")
-            if not self._is_workflow_aux_file(f.name)
-        ])
+        current_id = self.api.current_wf_id
+        msg = ["📂 已配置工作流", "━━━━━━━━━━━━━━━━━━"]
 
-        if not files:
-            yield event.plain_result("📂 目录中没有工作流文件")
-            return
-
-        current_file = self.api.wf_filename if self.api else "未知"
-        msg = ["📂 可用工作流列表", "━━━━━━━━━━━━━━━━━━"]
-
-        for i, f in enumerate(files, 1):
-            stem = Path(f).stem
-            sidecar = self.workflow_dir / f"{stem}.steps.json"
-            steps_info = ""
-            if sidecar.exists():
-                try:
-                    with open(sidecar, "r", encoding="utf-8") as sf:
-                        data = json.load(sf)
-                        if data and isinstance(data, dict):
-                            count = len(data)
-                            steps_info = f" [覆盖:{count}项]"
-                except:
-                    pass
-            if f == current_file:
-                msg.append(f"✅ {i}. {f}{steps_info} (当前)")
-            else:
-                msg.append(f"   {i}. {f}{steps_info}")
+        for wf_id in sorted(self.api.workflows.keys()):
+            wf = self.api.workflows[wf_id]
+            sid = wf.get("server_id", 0)
+            marker = " ✅ (当前)" if wf_id == current_id else ""
+            msg.append(f"  ID {wf_id}: {wf['filename']} [服务器{sid}]{marker}")
 
         msg.append("")
         msg.append("━━━━━━━━━━━━━━━━━━")
-        msg.append("切换：/comfy_use <序号>")
-        msg.append("覆盖：/comfy_add <节点ID> <步数>")
-        msg.append("查看：/comfy_add list")
+        msg.append("切换：/comfy_use <ID>")
+        msg.append("临时：/画图 <ID> <提示词>")
 
         yield event.plain_result("\n".join(msg))
 
@@ -566,45 +531,25 @@ class ComfyUIPlugin(Star):
         if len(args) < 2:
             yield event.plain_result(
                 "❌ 参数不足\n"
-                "用法：/comfy_use <序号> [正面ID] [负面ID] [输出ID]\n"
-                "示例：/comfy_use 1 6 7 9"
+                "用法：/comfy_use <工作流ID>\n"
+                "示例：/comfy_use 0"
             )
             return
 
         try:
-            files = sorted([
-                f.name for f in self.workflow_dir.glob("*.json")
-                if not self._is_workflow_aux_file(f.name)
-            ])
-            index = int(args[1])
-            if not (1 <= index <= len(files)):
-                yield event.plain_result(f"❌ 序号错误，请输入 1 到 {len(files)} 之间的数字")
-                return
-            filename = files[index - 1]
+            wf_id = int(args[1])
         except ValueError:
-            yield event.plain_result("❌ 请输入有效的数字序号")
+            yield event.plain_result("❌ 请输入有效的数字 ID")
             return
-        except Exception as e:
-            yield event.plain_result(f"❌ 查找工作流失败: {e}")
-            return
-
-        inp_id = args[2] if len(args) > 2 else None
-        neg_id = args[3] if len(args) > 3 else None
-        out_id = args[4] if len(args) > 4 else None
 
         if not self.api:
             yield event.plain_result("❌ ComfyUI API 未初始化")
             return
 
-        exists, msg = self.api.reload_config(
-            filename,
-            input_id=inp_id,
-            neg_node_id=neg_id,
-            output_id=out_id
-        )
+        exists, msg = self.api.reload_config(wf_id)
 
         status = "✅" if exists else "⚠️"
-        logger.info(f"[ComfyUI] 管理员 {user_id} 切换工作流: {filename}")
+        logger.info(f"[ComfyUI] 管理员 {user_id} 切换工作流: ID={wf_id}")
         yield event.plain_result(f"{status} {msg}")
 
     @filter.command("comfy_save")
@@ -643,7 +588,6 @@ class ComfyUIPlugin(Star):
         try:
             with open(save_path, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, indent=2, ensure_ascii=False)
-            self._auto_update_schema()
             logger.info(f"[ComfyUI] 管理员 {user_id} 导入工作流: {filename}")
             yield event.plain_result(
                 f"✅ 保存成功！\n"
@@ -816,14 +760,19 @@ class ComfyUIPlugin(Star):
 
     @filter.command("当前工作流", aliases=["comfy_current", "当前wf"])
     async def cmd_comfy_current(self, event: AstrMessageEvent):
-        current_file = self.config.get("json_file") or self.config.get("workflow_json") or "未配置"
-        input_id = self.config.get("input_node_id") or self.config.get("input_id") or "未配置"
-        output_id = self.config.get("output_node_id") or self.config.get("output_id") or "未配置"
+        if not self.api:
+            yield event.plain_result("❌ ComfyUI API 未初始化")
+            return
+        wf_id = self.api.current_wf_id
+        wf = self.api.workflows.get(wf_id, {})
         lines = [
             "🧠 当前 ComfyUI 工作流",
-            f"- 文件: {current_file}",
-            f"- 输入节点: {input_id}",
-            f"- 输出节点: {output_id}",
+            f"  ID: {wf_id}",
+            f"  文件: {wf.get('filename', '未知')}",
+            f"  正面节点: {wf.get('input_id', '未知')}",
+            f"  负面节点: {wf.get('neg_node_id', '未设置') or '未设置'}",
+            f"  输出节点: {wf.get('output_id', '未设置') or '自动'}",
+            f"  服务器: {self.api.current_server_id} ({self.api.server_address})",
         ]
         yield event.plain_result("\n".join(lines))
 

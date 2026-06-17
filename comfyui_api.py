@@ -88,13 +88,10 @@ def _http_post(url, **kwargs):
 
 class ComfyUI:
     def __init__(self, config: dict, data_dir: Path = None) -> None:
-        self.server_address = _normalize_server_address(config.get("server_address", "127.0.0.1:8188"))
-        if self.server_address.startswith("http"):
-            self.url = self.server_address
-        elif "." in self.server_address and ":" not in self.server_address:
-            self.url = f"https://{self.server_address}"
-        else:
-            self.url = f"http://{self.server_address}"
+        self.servers = {}
+        self.server_address = ""
+        self.url = ""
+        self.current_server_id = 0
 
         sub_conf = config.get("sub_config", {})
         self.steps = sub_conf.get("steps", 20)
@@ -102,11 +99,12 @@ class ComfyUI:
         self.height = sub_conf.get("height", 1024)
         self.neg_prompt = sub_conf.get("negative_prompt", "")
 
-        wf_conf = config.get("workflow_settings", {})
-        self.wf_filename = wf_conf.get("json_file", "workflow_api.json")
-        self.input_id = str(wf_conf.get("input_node_id", "6"))
-        self.neg_node_id = str(wf_conf.get("neg_node_id", ""))
-        self.output_id = str(wf_conf.get("output_node_id", "9"))
+        self.workflows = {}
+        self.current_wf_id = 0
+        self.wf_filename = "workflow_api.json"
+        self.input_id = "6"
+        self.neg_node_id = ""
+        self.output_id = ""
         self.seed_id = None
 
         if data_dir is not None:
@@ -116,32 +114,117 @@ class ComfyUI:
             logger.warning("[ComfyUI API] data_dir missing, fallback to plugin dir")
 
         self.workflow_dir = self.data_dir / "workflow"
-        self.workflow_path = self.workflow_dir / self.wf_filename
+        self._parse_servers(config.get("servers", ""))
+        self._parse_workflows(config.get("workflows", ""))
 
         logger.info(
-            f"[ComfyUI API] loaded | workflow_dir: {self.workflow_dir} | workflow: {self.wf_filename}"
+            f"[ComfyUI API] loaded | {len(self.servers)} server(s), {len(self.workflows)} workflow(s)"
         )
 
-    def reload_config(self, filename: str, input_id: str = None, output_id: str = None, neg_node_id: str = None):
-        self.wf_filename = filename
-        self.workflow_path = self.workflow_dir / filename
+    def _parse_servers(self, raw: str):
+        self.servers = {}
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(";")]
+            if len(parts) < 2:
+                continue
+            try:
+                sid = int(parts[0])
+            except ValueError:
+                continue
+            address = parts[1]
+            if not address:
+                continue
+            self.servers[sid] = address
 
-        if input_id:
-            self.input_id = str(input_id)
-        if output_id:
-            self.output_id = str(output_id)
-        if neg_node_id:
-            self.neg_node_id = str(neg_node_id)
+        if not self.servers:
+            self.servers[0] = "127.0.0.1:8188"
+            logger.warning("[ComfyUI] 未配置服务器，使用默认 127.0.0.1:8188")
+
+    def _parse_workflows(self, raw: str):
+        self.workflows = {}
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(";")]
+            if len(parts) < 5:
+                continue
+            try:
+                wf_id = int(parts[0])
+            except ValueError:
+                continue
+            server_id = 0
+            if len(parts) > 5 and parts[5]:
+                try:
+                    server_id = int(parts[5])
+                except ValueError:
+                    server_id = 0
+            self.workflows[wf_id] = {
+                "filename": parts[1] or "workflow_api.json",
+                "input_id": parts[2] or "6",
+                "neg_node_id": parts[3] or "",
+                "output_id": parts[4] or "",
+                "server_id": server_id,
+            }
+
+        if 0 in self.workflows:
+            self._apply_workflow_config(0)
+        elif self.workflows:
+            first_id = next(iter(self.workflows))
+            self._apply_workflow_config(first_id)
+        else:
+            self.current_wf_id = 0
+            self.wf_filename = "workflow_api.json"
+            self.input_id = "6"
+            self.neg_node_id = ""
+            self.output_id = ""
+            logger.warning("[ComfyUI] 未配置工作流，使用硬编码默认值")
+
+        self.workflow_path = self.workflow_dir / self.wf_filename
+
+    def _apply_workflow_config(self, workflow_id: int):
+        wf = self.workflows.get(workflow_id)
+        if not wf:
+            logger.warning(f"[ComfyUI] 工作流 ID {workflow_id} 不存在，无法应用")
+            return
+        self.current_wf_id = workflow_id
+        self.wf_filename = wf["filename"]
+        self.workflow_path = self.workflow_dir / self.wf_filename
+        self.input_id = str(wf["input_id"])
+        self.neg_node_id = str(wf["neg_node_id"])
+        self.output_id = str(wf["output_id"])
+
+        server_id = wf.get("server_id", 0)
+        self._apply_server(server_id)
+
+    def _apply_server(self, server_id: int):
+        raw = self.servers.get(server_id)
+        if not raw:
+            raw = self.servers.get(0, "127.0.0.1:8188")
+            server_id = 0
+        self.current_server_id = server_id
+        self.server_address = _normalize_server_address(raw)
+        self.url = self.server_address
+
+    def reload_config(self, workflow_id: int):
+        if workflow_id not in self.workflows:
+            return False, f"❌ 工作流 ID {workflow_id} 不存在"
+
+        self._apply_workflow_config(workflow_id)
 
         exists = self.workflow_path.exists()
         status = "exists" if exists else "missing"
 
         logger.info(
-            f"[ComfyUI] switch workflow -> {filename} [{status}] | "
+            f"[ComfyUI] switch workflow -> ID={workflow_id} ({self.wf_filename}) | server={self.current_server_id} [{status}] | "
             f"Input:{self.input_id} | Neg:{self.neg_node_id} | Output:{self.output_id or 'auto'}"
         )
         return exists, (
-            f"已切换至 {filename}，文件状态：{status}\n"
+            f"已切换至 ID={workflow_id} ({self.wf_filename})，文件状态：{status}\n"
+            f"服务器: {self.current_server_id} ({self.server_address})\n"
             f"当前节点设置: Positive={self.input_id}, Negative={self.neg_node_id}, Output={self.output_id or '自动'}"
         )
 
@@ -301,62 +384,73 @@ class ComfyUI:
 
         return override_count
 
-    async def generate(self, prompt):
+    async def generate(self, prompt, override_wf_id: int = None):
         client_id = str(random.randint(100000, 999999))
+
+        prev_wf_id = self.current_wf_id
+        if override_wf_id is not None:
+            if override_wf_id not in self.workflows:
+                return None, f"工作流 ID {override_wf_id} 不存在", prompt
+            self._apply_workflow_config(override_wf_id)
+
         try:
-            workflow = self._load_workflow()
-        except Exception as e:
-            return None, str(e), prompt
-
-        final_prompt = self._inject_params(workflow, prompt)
-
-        async with aiohttp.ClientSession() as session:
-            payload = {"prompt": workflow, "client_id": client_id}
             try:
-                async with session.post(f"{self.url}/prompt", json=payload) as resp:
-                    if resp.status != 200:
-                        return None, f"连接 ComfyUI 失败: {resp.status}", final_prompt
-                    res_json = await resp.json()
-                    prompt_id = res_json.get("prompt_id")
+                workflow = self._load_workflow()
             except Exception as e:
-                return None, f"请求报错: {str(e)}", final_prompt
+                return None, str(e), prompt
 
-            for _ in range(300):
-                await asyncio.sleep(1)
+            final_prompt = self._inject_params(workflow, prompt)
+
+            async with aiohttp.ClientSession() as session:
+                payload = {"prompt": workflow, "client_id": client_id}
                 try:
-                    async with session.get(f"{self.url}/history/{prompt_id}") as h_resp:
-                        if h_resp.status != 200:
-                            continue
-                        history = await h_resp.json()
-                except Exception:
-                    continue
+                    async with session.post(f"{self.url}/prompt", json=payload) as resp:
+                        if resp.status != 200:
+                            return None, f"连接 ComfyUI 失败: {resp.status}", final_prompt
+                        res_json = await resp.json()
+                        prompt_id = res_json.get("prompt_id")
+                except Exception as e:
+                    return None, f"请求报错: {str(e)}", final_prompt
 
-                if prompt_id in history:
-                    outputs = history[prompt_id].get("outputs", {})
-                    img_info = None
+                for _ in range(300):
+                    await asyncio.sleep(1)
+                    try:
+                        async with session.get(f"{self.url}/history/{prompt_id}") as h_resp:
+                            if h_resp.status != 200:
+                                continue
+                            history = await h_resp.json()
+                    except Exception:
+                        continue
 
-                    if self.output_id and self.output_id in outputs:
-                        imgs = outputs[self.output_id].get("images", [])
-                        if imgs:
-                            img_info = imgs[0]
+                    if prompt_id in history:
+                        outputs = history[prompt_id].get("outputs", {})
+                        img_info = None
 
-                    if not img_info:
-                        for node_out in outputs.values():
-                            if "images" in node_out and node_out["images"]:
-                                img_info = node_out["images"][0]
-                                break
+                        if self.output_id and self.output_id in outputs:
+                            imgs = outputs[self.output_id].get("images", [])
+                            if imgs:
+                                img_info = imgs[0]
 
-                    if img_info:
-                        fname = img_info["filename"]
-                        sfolder = img_info["subfolder"]
-                        itype = img_info["type"]
-                        img_url = f"{self.url}/view?filename={fname}&subfolder={sfolder}&type={itype}"
+                        if not img_info:
+                            for node_out in outputs.values():
+                                if "images" in node_out and node_out["images"]:
+                                    img_info = node_out["images"][0]
+                                    break
 
-                        async with session.get(img_url) as img_res:
-                            if img_res.status == 200:
-                                return await img_res.read(), None, final_prompt
-                            return None, "下载图片失败", final_prompt
+                        if img_info:
+                            fname = img_info["filename"]
+                            sfolder = img_info["subfolder"]
+                            itype = img_info["type"]
+                            img_url = f"{self.url}/view?filename={fname}&subfolder={sfolder}&type={itype}"
 
-                    return None, "工作流执行完成，但未找到输出图片", final_prompt
+                            async with session.get(img_url) as img_res:
+                                if img_res.status == 200:
+                                    return await img_res.read(), None, final_prompt
+                                return None, "下载图片失败", final_prompt
 
-            return None, "生成超时", final_prompt
+                        return None, "工作流执行完成，但未找到输出图片", final_prompt
+
+                return None, "生成超时", final_prompt
+        finally:
+            if override_wf_id is not None:
+                self._apply_workflow_config(prev_wf_id)
