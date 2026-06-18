@@ -92,6 +92,7 @@ class ComfyUI:
         self.server_address = ""
         self.url = ""
         self.current_server_id = 0
+        self.server_token = ""
 
         sub_conf = config.get("sub_config", {})
         self.steps = sub_conf.get("steps", 20)
@@ -137,10 +138,11 @@ class ComfyUI:
             address = parts[1]
             if not address:
                 continue
-            self.servers[sid] = address
+            token = parts[2] if len(parts) > 2 else ""
+            self.servers[sid] = {"address": address, "token": token}
 
         if not self.servers:
-            self.servers[0] = "127.0.0.1:8188"
+            self.servers[0] = {"address": "127.0.0.1:8188", "token": ""}
             logger.warning("[ComfyUI] 未配置服务器，使用默认 127.0.0.1:8188")
 
     def _parse_workflows(self, raw: str):
@@ -201,13 +203,14 @@ class ComfyUI:
         self._apply_server(server_id)
 
     def _apply_server(self, server_id: int):
-        raw = self.servers.get(server_id)
-        if not raw:
-            raw = self.servers.get(0, "127.0.0.1:8188")
+        info = self.servers.get(server_id)
+        if not info:
+            info = self.servers.get(0, {"address": "127.0.0.1:8188", "token": ""})
             server_id = 0
         self.current_server_id = server_id
-        self.server_address = _normalize_server_address(raw)
+        self.server_address = _normalize_server_address(info.get("address", ""))
         self.url = self.server_address
+        self.server_token = info.get("token", "")
 
     def reload_config(self, workflow_id: int):
         if workflow_id not in self.workflows:
@@ -234,10 +237,14 @@ class ComfyUI:
         with open(self.workflow_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _inject_params(self, workflow, prompt):
-        node = workflow.get(self.input_id)
+    def _inject_params(self, workflow, prompt, input_id=None, neg_node_id=None, neg_prompt=None, workflow_path=None):
+        _input_id = input_id or self.input_id
+        _neg_node_id = neg_node_id if neg_node_id is not None else self.neg_node_id
+        _neg_prompt = neg_prompt if neg_prompt is not None else self.neg_prompt
+
+        node = workflow.get(_input_id)
         if not node:
-            logger.error(f"critical: input node id {self.input_id} not found in workflow")
+            logger.error(f"critical: input node id {_input_id} not found in workflow")
             return prompt
 
         inputs = node.get("inputs", {})
@@ -262,22 +269,22 @@ class ComfyUI:
                 final_prompt = inputs[key]
                 break
 
-        if self.neg_node_id and self.neg_prompt:
-            neg_node = workflow.get(self.neg_node_id)
+        if _neg_node_id and _neg_prompt:
+            neg_node = workflow.get(_neg_node_id)
             if neg_node:
                 n_inputs = neg_node.get("inputs", {})
                 n_keys = ["text", "string", "negative", "text_negative", "prompt"]
                 for n_key in n_keys:
                     if n_key in n_inputs:
                         existing_neg = str(n_inputs.get(n_key, "")).strip()
-                        config_neg = self.neg_prompt.strip()
+                        config_neg = _neg_prompt.strip()
                         if existing_neg and config_neg:
                             n_inputs[n_key] = f"{existing_neg}, {config_neg}"
                         elif config_neg:
                             n_inputs[n_key] = config_neg
                         break
 
-        overrides = self._load_steps_override()
+        overrides = self._load_steps_override(workflow_path)
         if overrides:
             count = self._apply_steps_override(workflow, overrides)
             if count > 0:
@@ -315,10 +322,11 @@ class ComfyUI:
 
         return final_prompt
 
-    def _load_steps_override(self) -> dict:
+    def _load_steps_override(self, workflow_path=None) -> dict:
         try:
-            stem = self.workflow_path.stem
-            sidecar = self.workflow_path.parent / f"{stem}.steps.json"
+            wf_path = workflow_path or self.workflow_path
+            stem = wf_path.stem
+            sidecar = wf_path.parent / f"{stem}.steps.json"
             if not sidecar.exists():
                 return {}
             with open(sidecar, "r", encoding="utf-8") as f:
@@ -387,70 +395,158 @@ class ComfyUI:
     async def generate(self, prompt, override_wf_id: int = None):
         client_id = str(random.randint(100000, 999999))
 
-        prev_wf_id = self.current_wf_id
-        if override_wf_id is not None:
-            if override_wf_id not in self.workflows:
-                return None, f"工作流 ID {override_wf_id} 不存在", prompt
-            self._apply_workflow_config(override_wf_id)
+        wf_id = override_wf_id if override_wf_id is not None else self.current_wf_id
+        wf = self.workflows.get(wf_id)
+        if not wf:
+            return None, f"工作流 ID {wf_id} 不存在", prompt
+
+        server_id = wf.get("server_id", 0)
+        server_info = self.servers.get(server_id, {"address": "127.0.0.1:8188", "token": ""})
+        server_address = _normalize_server_address(server_info.get("address", "127.0.0.1:8188"))
+        server_token = server_info.get("token", "")
+
+        headers = {}
+        if server_token:
+            headers["Authorization"] = f"Bearer {server_token}"
+
+        workflow_path = self.workflow_dir / wf["filename"]
+        input_id = str(wf["input_id"])
+        neg_node_id = str(wf["neg_node_id"])
+        output_id = str(wf["output_id"])
 
         try:
+            if not workflow_path.exists():
+                return None, f"工作流文件不存在: {workflow_path}", prompt
+            with open(workflow_path, "r", encoding="utf-8") as f:
+                workflow = json.load(f)
+        except Exception as e:
+            return None, str(e), prompt
+
+        final_prompt = self._inject_params(
+            workflow, prompt,
+            input_id=input_id,
+            neg_node_id=neg_node_id,
+            neg_prompt=self.neg_prompt,
+            workflow_path=workflow_path,
+        )
+
+        async with aiohttp.ClientSession() as session:
+            payload = {"prompt": workflow, "client_id": client_id}
             try:
-                workflow = self._load_workflow()
+                async with session.post(f"{server_address}/prompt", json=payload, headers=headers) as resp:
+                    if resp.status != 200:
+                        return None, f"连接 ComfyUI 失败: {resp.status}", final_prompt
+                    res_json = await resp.json()
+                    prompt_id = res_json.get("prompt_id")
             except Exception as e:
-                return None, str(e), prompt
+                return None, f"请求报错: {str(e)}", final_prompt
 
-            final_prompt = self._inject_params(workflow, prompt)
-
-            async with aiohttp.ClientSession() as session:
-                payload = {"prompt": workflow, "client_id": client_id}
+            for _ in range(300):
+                await asyncio.sleep(1)
                 try:
-                    async with session.post(f"{self.url}/prompt", json=payload) as resp:
-                        if resp.status != 200:
-                            return None, f"连接 ComfyUI 失败: {resp.status}", final_prompt
-                        res_json = await resp.json()
-                        prompt_id = res_json.get("prompt_id")
-                except Exception as e:
-                    return None, f"请求报错: {str(e)}", final_prompt
+                    async with session.get(f"{server_address}/history/{prompt_id}", headers=headers) as h_resp:
+                        if h_resp.status != 200:
+                            continue
+                        history = await h_resp.json()
+                except Exception:
+                    continue
 
-                for _ in range(300):
-                    await asyncio.sleep(1)
-                    try:
-                        async with session.get(f"{self.url}/history/{prompt_id}") as h_resp:
-                            if h_resp.status != 200:
-                                continue
-                            history = await h_resp.json()
-                    except Exception:
-                        continue
+                if prompt_id in history:
+                    outputs = history[prompt_id].get("outputs", {})
+                    img_info = None
 
-                    if prompt_id in history:
-                        outputs = history[prompt_id].get("outputs", {})
-                        img_info = None
+                    if output_id and output_id in outputs:
+                        imgs = outputs[output_id].get("images", [])
+                        if imgs:
+                            img_info = imgs[0]
 
-                        if self.output_id and self.output_id in outputs:
-                            imgs = outputs[self.output_id].get("images", [])
-                            if imgs:
-                                img_info = imgs[0]
+                    if not img_info:
+                        for node_out in outputs.values():
+                            if "images" in node_out and node_out["images"]:
+                                img_info = node_out["images"][0]
+                                break
 
-                        if not img_info:
-                            for node_out in outputs.values():
-                                if "images" in node_out and node_out["images"]:
-                                    img_info = node_out["images"][0]
-                                    break
+                    if img_info:
+                        fname = img_info["filename"]
+                        sfolder = img_info["subfolder"]
+                        itype = img_info["type"]
+                        img_url = f"{server_address}/view?filename={fname}&subfolder={sfolder}&type={itype}"
 
-                        if img_info:
-                            fname = img_info["filename"]
-                            sfolder = img_info["subfolder"]
-                            itype = img_info["type"]
-                            img_url = f"{self.url}/view?filename={fname}&subfolder={sfolder}&type={itype}"
+                        async with session.get(img_url, headers=headers) as img_res:
+                            if img_res.status == 200:
+                                return await img_res.read(), None, final_prompt
+                            return None, "下载图片失败", final_prompt
 
-                            async with session.get(img_url) as img_res:
-                                if img_res.status == 200:
-                                    return await img_res.read(), None, final_prompt
-                                return None, "下载图片失败", final_prompt
+                    return None, "工作流执行完成，但未找到输出图片", final_prompt
 
-                        return None, "工作流执行完成，但未找到输出图片", final_prompt
+            return None, "生成超时", final_prompt
 
-                return None, "生成超时", final_prompt
-        finally:
-            if override_wf_id is not None:
-                self._apply_workflow_config(prev_wf_id)
+    async def upload_image(self, image_data: bytes, filename: str) -> str:
+        headers = {}
+        if self.server_token:
+            headers["Authorization"] = f"Bearer {self.server_token}"
+        async with aiohttp.ClientSession() as session:
+            data = aiohttp.FormData()
+            data.add_field('image', image_data, filename=filename, content_type='application/octet-stream')
+            data.add_field('type', 'input')
+            data.add_field('overwrite', 'true')
+            async with session.post(f"{self.url}/upload/image", data=data, headers=headers) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    return result.get('name', filename)
+                raise Exception(f"上传图片失败: {resp.status}")
+
+    async def execute_tagger(self, image_filename: str, model: str = "wd-v1-4-moat-tagger-v2",
+                             threshold: float = 0.35, char_threshold: float = 0.85) -> tuple:
+        client_id = str(random.randint(100000, 999999))
+
+        workflow = {
+            "2": {"inputs": {"image": image_filename}, "class_type": "LoadImage"},
+            "1": {
+                "inputs": {
+                    "model": model,
+                    "threshold": threshold,
+                    "character_threshold": char_threshold,
+                    "replace_underscore": False,
+                    "trailing_comma": False,
+                    "exclude_tags": "",
+                    "tags": "",
+                    "image": ["2", 0],
+                },
+                "class_type": "WD14Tagger|pysssss",
+            }
+        }
+
+        headers = {}
+        if self.server_token:
+            headers["Authorization"] = f"Bearer {self.server_token}"
+
+        async with aiohttp.ClientSession() as session:
+            payload = {"prompt": workflow, "client_id": client_id}
+            try:
+                async with session.post(f"{self.url}/prompt", json=payload, headers=headers) as resp:
+                    if resp.status != 200:
+                        return None, f"连接 ComfyUI 失败: {resp.status}"
+                    res_json = await resp.json()
+                    prompt_id = res_json.get("prompt_id")
+            except Exception as e:
+                return None, f"请求报错: {str(e)}"
+
+            for _ in range(300):
+                await asyncio.sleep(1)
+                try:
+                    async with session.get(f"{self.url}/history/{prompt_id}", headers=headers) as h_resp:
+                        if h_resp.status != 200:
+                            continue
+                        history = await h_resp.json()
+                except Exception:
+                    continue
+
+                if prompt_id in history:
+                    tags_list = history[prompt_id].get("outputs", {}).get("1", {}).get("tags", [])
+                    if tags_list:
+                        tags_str = tags_list[0] if isinstance(tags_list, list) else tags_list
+                        return tags_str, None
+                    return None, "Tagger 未返回标签"
+
+            return None, "Tagger 执行超时"

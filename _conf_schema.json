@@ -1,6 +1,6 @@
 {
   "servers": {
-    "description": "ComfyUI 服务端配置，每行一个。\n格式：id;IP:端口\nid 为数字标识，0 号固定为默认服务器。\n示例：\n0;127.0.0.1:8188\n1;192.168.1.200:8188",
+    "description": "ComfyUI 服务端配置，每行一个。\n格式：id;IP:端口;[token]\nid 为数字标识，0 号固定为默认服务器。token 为可选，用于 ComfyUI-Login 鉴权。\n示例：\n0;127.0.0.1:8188\n1;192.168.1.200:8188;my_token_here",
     "type": "text",
     "default": "0;127.0.0.1:8188"
   },
@@ -80,5 +80,10 @@
         }
       }
     }
+  },
+  "tagger_model": {
+    "description": "WD14 Tagger 模型名称。如果不确定，先在 ComfyUI 节点管理器中确认【WD14Tagger|pysssss】节点的 model 字段可选值。",
+    "type": "string",
+    "default": "wd-v1-4-moat-tagger-v2"
   }
 }

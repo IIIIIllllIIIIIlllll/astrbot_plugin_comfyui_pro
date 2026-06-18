@@ -6,6 +6,7 @@ import re
 import traceback
 import json
 import shutil
+import asyncio
 from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -29,6 +30,12 @@ class DrawTask:
     prompt: str
     direct_send: bool
     override_wf_id: int | None = None
+
+
+@dataclass
+class TaggerTask:
+    event: AstrMessageEvent
+    image_data: bytes
 
 
 @register(
@@ -146,7 +153,12 @@ class ComfyUIPlugin(Star):
             self.drawing_prompt_messages = list(self._DRAWING_PROMPT_MESSAGES)
 
         self._draw_queue = asyncio.Queue()
-        self._queue_worker_task = None
+        self._processing_count = 0
+        self._queue_workers = []
+
+        self._tagger_queue = asyncio.Queue()
+        self._tagger_processing_count = 0
+        self.tagger_model = config.get("tagger_model", "wd-v1-4-moat-tagger-v2")
 
     def _get_persistent_dir(self) -> Path:
         data_path = None
@@ -245,8 +257,14 @@ class ComfyUIPlugin(Star):
         return parts[1].strip() if len(parts) > 1 else ""
 
     async def initialize(self):
-        self._queue_worker_task = asyncio.create_task(self._queue_worker())
-        logger.info("[ComfyUI] 🎨 插件初始化完成")
+        worker_count = len(self.api.servers)
+        self._queue_workers = []
+        for i in range(worker_count):
+            w = asyncio.create_task(self._queue_worker(i))
+            self._queue_workers.append(w)
+
+        self._tagger_worker_task = asyncio.create_task(self._tagger_worker())
+        logger.info(f"[ComfyUI] 🎨 插件初始化完成，{worker_count} 个绘图队列 + 1 个标签队列工作者")
 
     # ====== 核心绘图逻辑 ======
     async def _handle_paint_logic(self, event: AstrMessageEvent, direct_send: bool):
@@ -294,8 +312,8 @@ class ComfyUIPlugin(Star):
                 yield event.plain_result(message)
                 return
 
-            n_ahead = self._draw_queue.qsize() + 1
-            if n_ahead == 1:
+            n_ahead = self._draw_queue.qsize() + self._processing_count
+            if n_ahead == 0:
                 await event.send(event.plain_result(
                     random.choice(self.drawing_prompt_messages)
                 ))
@@ -313,13 +331,16 @@ class ComfyUIPlugin(Star):
             message = f"❌ 执行出错：{str(e)[:50]}"
             yield event.plain_result(message)
 
-    async def _queue_worker(self):
+    async def _queue_worker(self, worker_id: int):
         while True:
             task = await self._draw_queue.get()
+            self._processing_count += 1
             try:
                 await self._execute_task(task)
             except Exception as e:
-                logger.error(f"[ComfyUI] 队列任务异常: {e}")
+                logger.error(f"[ComfyUI] 队列任务[{worker_id}] 异常: {e}")
+            finally:
+                self._processing_count -= 1
 
     async def _execute_task(self, task: DrawTask):
         if not getattr(self, 'api', None):
@@ -364,6 +385,42 @@ class ComfyUIPlugin(Star):
             logger.error(traceback.format_exc())
             await task.event.send(task.event.plain_result(f"❌ 内部错误: {str(e)[:50]}"))
 
+    async def _tagger_worker(self):
+        while True:
+            task = await self._tagger_queue.get()
+            self._tagger_processing_count += 1
+            try:
+                await self._execute_tagger_task(task)
+            except Exception as e:
+                logger.error(f"[ComfyUI] Tagger 队列异常: {e}")
+            finally:
+                self._tagger_processing_count -= 1
+
+    async def _execute_tagger_task(self, task: TaggerTask):
+        if not getattr(self, 'api', None):
+            await task.event.send(task.event.plain_result("❌ ComfyUI 服务未连接，请检查配置"))
+            return
+
+        try:
+            ext = ".png"
+            filename = f"{uuid.uuid4()}{ext}"
+            uploaded_name = await self.api.upload_image(task.image_data, filename)
+
+            tags, error = await self.api.execute_tagger(uploaded_name, model=self.tagger_model)
+
+            if error:
+                logger.error(f"[ComfyUI] Tagger 反推失败: {error}")
+                await task.event.send(task.event.plain_result(f"❌ 反推标签失败：{error}"))
+                return
+
+            logger.info(f"[ComfyUI] ✅ Tagger 反推完成: {tags[:80]}...")
+            await task.event.send(task.event.plain_result(f"🏷️ 反推标签:\n{tags}"))
+
+        except Exception as e:
+            logger.error(f"[ComfyUI] Tagger 执行异常: {e}")
+            logger.error(traceback.format_exc())
+            await task.event.send(task.event.plain_result(f"❌ 反推失败：{str(e)[:50]}"))
+
     # ====== 命令 ======
     @filter.command("comfy帮助")
     async def cmd_comfyui_help(self, event: AstrMessageEvent):
@@ -385,6 +442,7 @@ class ComfyUIPlugin(Star):
             "  /画图 <提示词>     生成图片（转发模式）",
             "  /画图no <提示词>   生成图片（直发模式）",
             "  /重绘 <提示词>     生成图片（直发模式）",
+            "  /tagger (图片)     反推图片标签",
             "  /comfy帮助         显示此帮助",
             "",
         ]
@@ -848,8 +906,8 @@ class ComfyUIPlugin(Star):
             yield event.plain_result(f"❌ LLM 翻译失败：{str(e)[:50]}")
             return
 
-        n_ahead = self._draw_queue.qsize() + 1
-        if n_ahead == 1:
+        n_ahead = self._draw_queue.qsize() + self._processing_count
+        if n_ahead == 0:
             await event.send(event.plain_result(random.choice(self.drawing_prompt_messages)))
         else:
             await event.send(event.plain_result(
@@ -858,6 +916,45 @@ class ComfyUIPlugin(Star):
         await self._draw_queue.put(DrawTask(
             event=event, prompt=tags, direct_send=False
         ))
+
+    @filter.command("tagger")
+    async def cmd_tagger(self, event: AstrMessageEvent):
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            yield event.plain_result(reason)
+            return
+
+        if not getattr(self, 'api', None):
+            yield event.plain_result("❌ ComfyUI 服务未连接，请检查配置")
+            return
+
+        image_data = None
+        for comp in event.message_obj.message:
+            if isinstance(comp, Image):
+                path = await comp.convert_to_file_path()
+                with open(path, 'rb') as f:
+                    image_data = f.read()
+                break
+            elif isinstance(comp, Reply) and comp.chain:
+                for reply_comp in comp.chain:
+                    if isinstance(reply_comp, Image):
+                        path = await reply_comp.convert_to_file_path()
+                        with open(path, 'rb') as f:
+                            image_data = f.read()
+                        break
+                if image_data:
+                    break
+        if not image_data:
+            yield event.plain_result("❌ 请发送图片")
+            return
+
+        n_ahead = self._tagger_queue.qsize() + self._tagger_processing_count
+        if n_ahead == 0:
+            await event.send(event.plain_result("🔄 正在反推标签，请稍等..."))
+        else:
+            await event.send(event.plain_result(f"⏳ 正在排队，前面还有 {n_ahead} 个请求"))
+
+        await self._tagger_queue.put(TaggerTask(event=event, image_data=image_data))
 
     # ====== 辅助方法 ======
     def _is_group_message(self, event: AstrMessageEvent) -> bool:
