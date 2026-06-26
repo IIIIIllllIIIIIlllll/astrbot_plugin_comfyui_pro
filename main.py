@@ -39,11 +39,10 @@ class TaggerTask:
 
 
 @register(
-    "astrbot_plugin_comfyui_pro",
+    "ComfyUI小助手",
     "lumingya",
-    "ComfyUI Pro 连接器",
-    "1.2.0",
-    "https://github.com/lumingya/astrbot_plugin_comfyui_pro"
+    "ComfyUI小助手",
+    "1.0.0",
 )
 class ComfyUIPlugin(Star):
     _DRAWING_PROMPT_MESSAGES = [
@@ -175,7 +174,7 @@ class ComfyUIPlugin(Star):
                         pass
         if data_path is None:
             current = Path.cwd()
-            data_path = current / "data" / "plugin_data" / "astrbot_plugin_comfyui_pro"
+            data_path = current / "data" / "plugin_data" / "astrbot_plugin_comfyui_helper"
         if not isinstance(data_path, Path):
             data_path = Path(data_path)
         data_path.mkdir(parents=True, exist_ok=True)
