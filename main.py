@@ -439,7 +439,7 @@ class ComfyUIPlugin(Star):
             "",
             "【基础指令】",
             "  /画图 <提示词>     生成图片（转发模式）",
-            "  /画图no <提示词>   生成图片（直发模式）",
+
             "  /重绘 <提示词>     生成图片（直发模式）",
             "  /tagger (图片)     反推图片标签",
             "  /comfy帮助         显示此帮助",
@@ -848,11 +848,6 @@ class ComfyUIPlugin(Star):
     @filter.command("画图", aliases=["绘画"])
     async def cmd_paint(self, event: AstrMessageEvent):
         async for result in self._handle_paint_logic(event, direct_send=False):
-            yield result
-
-    @filter.command("画图no")
-    async def cmd_paint_no(self, event: AstrMessageEvent):
-        async for result in self._handle_paint_logic(event, direct_send=True):
             yield result
 
     @filter.command("FF401")
