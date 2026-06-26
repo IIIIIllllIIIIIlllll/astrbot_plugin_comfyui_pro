@@ -440,7 +440,6 @@ class ComfyUIPlugin(Star):
             "【基础指令】",
             "  /画图 <提示词>     生成图片（转发模式）",
 
-            "  /重绘 <提示词>     生成图片（直发模式）",
             "  /tagger (图片)     反推图片标签",
             "  /comfy帮助         显示此帮助",
             "",
@@ -832,18 +831,6 @@ class ComfyUIPlugin(Star):
             f"  服务器: {self.api.current_server_id} ({self.api.server_address})",
         ]
         yield event.plain_result("\n".join(lines))
-
-    @filter.command("重绘", aliases=["重抽", "reroll"])
-    async def cmd_reroll(self, event: AstrMessageEvent):
-        full_msg = (event.message_str or "").strip()
-        full_msg = re.sub(r'\[At:\d+\]\s*', '', full_msg).strip()
-        parts = full_msg.split(None, 1)
-        prompt = parts[1].strip() if len(parts) > 1 else ""
-        if not prompt:
-            yield event.plain_result("📖 用法: /重绘 <提示词>\n示例: /重绘 1girl, silver hair, cinematic lighting")
-            return
-        async for result in self._handle_paint_logic(event, direct_send=True):
-            yield result
 
     @filter.command("画图", aliases=["绘画"])
     async def cmd_paint(self, event: AstrMessageEvent):
